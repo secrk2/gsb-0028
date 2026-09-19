@@ -7,11 +7,16 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from .auth import User, check_bl_scope, current_user, err, get_app_checked, get_app_or_404, is_admin
-from .db import (
-    CLUSTERS, ENV_LABELS, ENVIRONMENTS, STATUS_LABELS, STATUS_ORDER, STATUSES,
-    TERMINAL_STATUS, execute, get_conn, init_db, query, query_one,
+from . import permissions as perms
+from .auth import (
+    User, ensure_bl_visible, err, get_app_checked, get_app_or_404,
+    get_app_writable, is_admin, public_user,
 )
+from .db import (
+    CLUSTERS, ENV_LABELS, ENVIRONMENTS, ROLES, ROLE_LABELS, STATUS_LABELS, STATUS_ORDER,
+    STATUSES, TERMINAL_STATUS, execute, get_conn, init_db, query, query_one,
+)
+from .routers import admin as admin_router
 from .routers import config as config_router
 from .seed import seed_if_empty
 
@@ -19,6 +24,7 @@ STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
 app = FastAPI(title="织云系统", docs_url=None, redoc_url=None)
 app.include_router(config_router.router)
+app.include_router(admin_router.router)
 
 
 @app.on_event("startup")
@@ -116,8 +122,9 @@ def login(body: LoginIn):
     )
     if not row:
         raise err(401, "用户不存在")
-    row = dict(row)
-    return {"token": row.pop("token"), "user": row}
+    token = row["token"]
+    user = perms.build_principal(dict(row))
+    return {"token": token, "user": public_user(user)}
 
 
 @app.get("/api/public/users")
@@ -126,14 +133,19 @@ def public_users():
     rows = query(
         """SELECT u.id, u.username, u.name, u.role, b.name AS business_line_name
            FROM users u LEFT JOIN business_lines b ON b.id = u.business_line_id
-           ORDER BY u.role DESC, u.id"""
+           ORDER BY CASE u.role WHEN 'admin' THEN 0 WHEN 'bl_owner' THEN 1
+                                WHEN 'app_owner' THEN 2 ELSE 3 END, u.id"""
     )
-    return [dict(r) for r in rows]
+    return [{
+        "id": r["id"], "username": r["username"], "name": r["name"],
+        "role": r["role"], "role_label": ROLE_LABELS.get(r["role"], r["role"]),
+        "business_line_name": r["business_line_name"],
+    } for r in rows]
 
 
 @app.get("/api/me")
 def me(user: dict = User):
-    return user
+    return public_user(user)
 
 
 # ---------------------------------------------------------------- 元数据
@@ -144,6 +156,7 @@ def meta(user: dict = User):
         "environments": [{"value": e, "label": ENV_LABELS[e]} for e in ENVIRONMENTS],
         "statuses": [{"value": s, "label": STATUS_LABELS[s]} for s in STATUSES],
         "clusters": CLUSTERS,
+        "roles": [{"value": r, "label": ROLE_LABELS[r]} for r in ROLES],
     }
 
 
@@ -152,22 +165,40 @@ def business_lines(user: dict = User):
     if is_admin(user):
         rows = query("SELECT id, name, code FROM business_lines ORDER BY id")
     else:
-        rows = query("SELECT id, name, code FROM business_lines WHERE id = ?",
-                     (user["business_line_id"],))
+        visible = perms.visible_business_lines(user)
+        if not visible:
+            return []
+        placeholders = ",".join("?" * len(visible))
+        rows = query(
+            f"SELECT id, name, code FROM business_lines WHERE id IN ({placeholders}) ORDER BY id",
+            tuple(visible),
+        )
     return [dict(r) for r in rows]
 
 
 @app.get("/api/users")
 def users(user: dict = User, business_line_id: int | None = None):
-    sql = """SELECT u.id, u.name, u.username, u.business_line_id, b.name AS business_line_name
+    """人员目录：管理员全部；业务线负责人本业务线；其余角色限其可见业务线内成员。"""
+    sql = """SELECT u.id, u.name, u.username, u.role, u.business_line_id,
+                    b.name AS business_line_name
              FROM users u LEFT JOIN business_lines b ON b.id = u.business_line_id"""
     params: list = []
-    if not is_admin(user):
-        sql += " WHERE u.business_line_id = ?"
-        params.append(user["business_line_id"])
-    elif business_line_id:
-        sql += " WHERE u.business_line_id = ?"
-        params.append(business_line_id)
+    if is_admin(user):
+        if business_line_id:
+            sql += " WHERE u.business_line_id = ?"
+            params.append(business_line_id)
+    else:
+        visible = perms.visible_business_lines(user)
+        if business_line_id:
+            ensure_bl_visible(user, business_line_id)
+            ids = [business_line_id]
+        else:
+            ids = sorted(visible)
+        if not ids:
+            return []
+        placeholders = ",".join("?" * len(ids))
+        sql += f" WHERE u.business_line_id IN ({placeholders})"
+        params.extend(ids)
     sql += " ORDER BY u.id"
     return [dict(r) for r in query(sql, tuple(params))]
 
@@ -188,11 +219,13 @@ def list_apps(user: dict = User,
             sql += " AND business_line_id = ?"
             params.append(business_line_id)
     else:
-        # 成员强制限定本业务线；显式请求其他业务线属于越权，返回错误而非空列表
-        if business_line_id and business_line_id != user["business_line_id"]:
-            check_bl_scope(user, business_line_id)
-        sql += " AND business_line_id = ?"
-        params.append(user["business_line_id"])
+        # 显式按范围外业务线筛选属于越权：403 并说明可访问范围，而非静默空列表
+        if business_line_id:
+            ensure_bl_visible(user, business_line_id)
+        # 可见范围：本人负责的应用 + 被授权的 业务线×环境 + 业务线负责人的整条业务线
+        cond, cond_params = perms.scope_condition(user, "business_line_id", "environment", "owner_id")
+        sql += f" AND {cond}"
+        params.extend(cond_params)
     if owner_id:
         sql += " AND owner_id = ?"
         params.append(owner_id)
@@ -215,17 +248,20 @@ def list_apps(user: dict = User,
 
 @app.post("/api/apps", status_code=201)
 def create_app(body: AppCreateIn, user: dict = User):
-    check_bl_scope(user, body.business_line_id)
+    # 新建应用属于业务线管理动作：平台管理员或该业务线负责人
+    perms.ensure_can_manage_bl(user, body.business_line_id)
     if body.environment not in ENVIRONMENTS:
         raise err(400, f"非法环境：{body.environment}")
     if body.cluster not in CLUSTERS:
         raise err(400, f"非法集群：{body.cluster}，可选：{'、'.join(CLUSTERS)}")
     if body.owner_id is not None:
-        owner = query_one("SELECT id, business_line_id FROM users WHERE id = ?", (body.owner_id,))
+        owner = query_one("SELECT id, business_line_id, role FROM users WHERE id = ?", (body.owner_id,))
         if not owner:
             raise err(400, "负责人不存在")
         if owner["business_line_id"] != body.business_line_id:
             raise err(400, "负责人必须属于应用所在业务线")
+        if owner["role"] == "viewer":
+            raise err(400, "只读观察者不能担任应用负责人；如需指定，请先由平台管理员调整其角色")
     dup = query_one("SELECT id FROM applications WHERE business_line_id = ? AND name = ?",
                     (body.business_line_id, body.name.strip()))
     if dup:
@@ -247,6 +283,11 @@ def create_app(body: AppCreateIn, user: dict = User):
 def app_detail(app_id: int, user: dict = User):
     app_row = get_app_checked(user, app_id)
     data = app_to_dict(app_row, with_env=True)
+    data["can_manage"] = perms.can_manage_app(user, app_row)
+    data["can_transfer"] = (
+        perms.can_manage_bl(user, app_row["business_line_id"])
+        or (app_row["owner_id"] == user["id"] and user["role"] != "viewer")
+    )
     logs = query(
         """SELECT l.action, l.detail, l.created_at, u.name AS user_name
            FROM change_logs l LEFT JOIN users u ON u.id = l.user_id
@@ -254,12 +295,24 @@ def app_detail(app_id: int, user: dict = User):
         (app_id,),
     )
     data["change_logs"] = [dict(r) for r in logs]
+    transfers = query(
+        """SELECT t.id, t.old_owner_id, t.new_owner_id, t.note, t.created_at,
+                  ou.name AS old_owner_name, nu.name AS new_owner_name,
+                  du.name AS transfer_by_name
+           FROM app_transfers t
+           LEFT JOIN users ou ON ou.id = t.old_owner_id
+           LEFT JOIN users nu ON nu.id = t.new_owner_id
+           LEFT JOIN users du ON du.id = t.transfer_by_id
+           WHERE t.app_id = ? ORDER BY t.created_at DESC, t.id DESC""",
+        (app_id,),
+    )
+    data["transfers"] = [dict(r) for r in transfers]
     return data
 
 
 @app.patch("/api/apps/{app_id}")
 def update_app(app_id: int, body: AppUpdateIn, user: dict = User):
-    app_row = get_app_checked(user, app_id)
+    app_row = get_app_writable(user, app_id)
     if app_row["status"] == TERMINAL_STATUS:
         raise err(400, "应用已下线（终态），所有信息只读，禁止修改")
     changes = []
@@ -271,17 +324,14 @@ def update_app(app_id: int, body: AppUpdateIn, user: dict = User):
         changes.append(("name", body.name.strip(), f"应用更名：{app_row['name']} → {body.name.strip()}"))
     if body.set_owner:
         new_owner = body.owner_id
-        if new_owner is not None:
-            owner = query_one("SELECT id, name, business_line_id FROM users WHERE id = ?", (new_owner,))
-            if not owner:
-                raise err(400, "负责人不存在")
-            if owner["business_line_id"] != app_row["business_line_id"]:
-                raise err(400, "负责人必须属于应用所在业务线")
         if new_owner != app_row["owner_id"]:
-            old = query_one("SELECT name FROM users WHERE id = ?", (app_row["owner_id"],)) if app_row["owner_id"] else None
-            new = query_one("SELECT name FROM users WHERE id = ?", (new_owner,)) if new_owner else None
-            changes.append(("owner_id", new_owner,
-                            f"负责人变更：{old['name'] if old else '（空）'} → {new['name'] if new else '（空）'}"))
+            # 应用归属变更 = 交接，必须走 /api/apps/{id}/transfer 并留痕，
+            # 不允许在普通信息编辑里静默换负责人。
+            raise err(
+                400,
+                "应用归属（负责人）变更属于交接，必须通过「应用交接」流程办理，"
+                "系统会记录交接前后负责人与时间；普通信息编辑不接受直接改负责人。",
+            )
     if body.cluster is not None and body.cluster != app_row["cluster"]:
         if body.cluster not in CLUSTERS:
             raise err(400, f"非法集群：{body.cluster}")
@@ -304,7 +354,7 @@ def update_app(app_id: int, body: AppUpdateIn, user: dict = User):
 
 @app.post("/api/apps/{app_id}/status")
 def change_status(app_id: int, body: StatusIn, user: dict = User):
-    app_row = get_app_checked(user, app_id)
+    app_row = get_app_writable(user, app_id, "生命周期状态")
     old, new = app_row["status"], body.status
     if new not in STATUSES:
         raise err(400, f"非法状态：{new}，可选：{'/'.join(STATUSES)}")
@@ -325,7 +375,7 @@ def change_status(app_id: int, body: StatusIn, user: dict = User):
 
 @app.put("/api/apps/{app_id}/env-vars")
 def put_env_vars(app_id: int, body: EnvVarsIn, user: dict = User):
-    app_row = get_app_checked(user, app_id)
+    app_row = get_app_writable(user, app_id, "环境变量")
     if app_row["status"] == TERMINAL_STATUS:
         raise err(400, "应用已下线（终态），环境变量只读，禁止修改")
     seen: set = set()
@@ -352,10 +402,12 @@ def put_env_vars(app_id: int, body: EnvVarsIn, user: dict = User):
 
 @app.get("/api/console/summary")
 def console_summary(user: dict = User):
-    scope_sql, scope_params = "", []
-    if not is_admin(user):
-        scope_sql = " AND a.business_line_id = ?"
-        scope_params = [user["business_line_id"]]
+    if is_admin(user):
+        scope_sql, scope_params = "1=1", []
+    else:
+        scope_sql, scope_params = perms.scope_condition(
+            user, "a.business_line_id", "a.environment", "a.owner_id"
+        )
 
     bl_stats_sql = """SELECT b.id, b.name,
                    COUNT(a.id) AS total,
@@ -364,13 +416,21 @@ def console_summary(user: dict = User):
                    SUM(CASE WHEN a.status = 'maintenance'  THEN 1 ELSE 0 END) AS maintenance,
                    SUM(CASE WHEN a.status = 'offline'      THEN 1 ELSE 0 END) AS offline
             FROM business_lines b
-            LEFT JOIN applications a ON a.business_line_id = b.id
+            LEFT JOIN applications a ON a.business_line_id = b.id AND {scope}
             {where}
-            GROUP BY b.id ORDER BY total DESC, b.id"""
+            GROUP BY b.id HAVING total > 0 OR {bl_in_scope}
+            ORDER BY total DESC, b.id"""
     if is_admin(user):
-        by_bl = query(bl_stats_sql.format(where=""))
+        by_bl = query(bl_stats_sql.format(scope="1=1", where="", bl_in_scope="1=1"))
     else:
-        by_bl = query(bl_stats_sql.format(where="WHERE b.id = ?"), (user["business_line_id"],))
+        visible_bls = sorted(perms.visible_business_lines(user))
+        bl_ph = ",".join("?" * len(visible_bls)) if visible_bls else "0"
+        # LEFT JOIN 的范围条件必须放在 ON 上；WHERE 只保留"有可见业务线"的行
+        by_bl = query(
+            bl_stats_sql.format(scope=scope_sql, where=f"WHERE b.id IN ({bl_ph})",
+                                bl_in_scope="1=1"),
+            (*scope_params, *visible_bls),
+        )
 
     week_ago = int(time.time()) - 7 * 86400
     recent = query(
@@ -379,12 +439,15 @@ def console_summary(user: dict = User):
             FROM change_logs l
             JOIN applications a ON a.id = l.app_id
             JOIN business_lines b ON b.id = a.business_line_id
-            WHERE l.created_at >= ? {scope_sql}
+            WHERE l.created_at >= ? AND {scope_sql}
             GROUP BY a.id ORDER BY last_changed_at DESC LIMIT 20""",
         (week_ago, *scope_params),
     )
 
-    apps = query(f"SELECT a.* FROM applications a WHERE 1=1 {scope_sql}", tuple(scope_params))
+    apps = query(
+        f"SELECT a.* FROM applications a WHERE {scope_sql}",
+        tuple(scope_params),
+    )
     missing_owner, missing_env = [], []
     for row in apps:
         if row["owner_id"] is None:
@@ -401,7 +464,7 @@ def console_summary(user: dict = User):
         },
         "totals": {
             "apps": len(apps),
-            "business_lines": len(by_bl) if is_admin(user) else 1,
+            "business_lines": len(by_bl),
             "recent_changed": len(recent),
             "red_dot_apps": len({a["id"] for a in missing_owner} | {a["id"] for a in missing_env}),
         },

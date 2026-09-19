@@ -1,6 +1,12 @@
-"""初始数据：4 条业务线、9 个用户、24 个应用（覆盖 在研/上线/维保/下线 全部状态）。
+"""初始数据：4 条业务线、10 个用户（四类角色）、24 个应用（覆盖 在研/上线/维保/下线 全部状态）。
 
-部分应用故意缺失负责人或环境变量，用于控制台红点提示演示。
+权限演示样例：
+- 周婷（只读观察者）：仅被授予「数据平台 · 生产」配置查看权（脱敏），不能编辑、不能看明文；
+- 钱一（只读观察者）：仅能看「用户增长 · 生产」，且单独授予密文查看权 —— 能看明文但不能改；
+- 陈晨（应用负责人）：能编辑自己负责的应用，但生产环境默认没有密文查看权（编辑权 ≠ 明文权）；
+- 含一条应用交接留痕（周婷转岗，离线调度平台移交孙磊，配置随应用一并移交）。
+
+部分应用故意缺失负责人，用于控制台红点提示演示。
 变更日志时间相对启动时刻生成，保证"近 7 天有变更"开箱即有数据。
 """
 import json
@@ -18,16 +24,38 @@ BUSINESS_LINES = [
 ]
 
 # (username, 姓名, 角色, 业务线 code 或 None)
+# admin 平台管理员 / bl_owner 业务线负责人 / app_owner 应用负责人 / viewer 只读观察者
 USERS = [
-    ("admin",  "系统管理员", "admin",  None),
-    ("zhangwei", "张伟", "member", "pay"),
-    ("lina",     "李娜", "member", "pay"),
-    ("wangqiang", "王强", "member", "growth"),
-    ("chenchen", "陈晨", "member", "growth"),
-    ("liuyang",  "刘洋", "member", "supply"),
-    ("zhaomin",  "赵敏", "member", "supply"),
-    ("sunlei",   "孙磊", "member", "data"),
-    ("zhouting", "周婷", "member", "data"),
+    ("admin",    "系统管理员", "admin",     None),
+    ("zhangwei", "张伟", "bl_owner",  "pay"),
+    ("lina",     "李娜", "app_owner", "pay"),
+    ("wangqiang", "王强", "app_owner", "growth"),
+    ("chenchen", "陈晨", "app_owner", "growth"),
+    ("qianyi",   "钱一", "viewer",    "growth"),
+    ("liuyang",  "刘洋", "bl_owner",  "supply"),
+    ("zhaomin",  "赵敏", "app_owner", "supply"),
+    ("sunlei",   "孙磊", "app_owner", "data"),
+    ("zhouting", "周婷", "viewer",    "data"),
+]
+
+# (被授权人 username, 业务线 code, 环境 '*'或具体, 可编辑, 可看明文, 授权人 username, 距今天数)
+# 查看权随授予默认开放；密文查看权与编辑权分别给。
+GRANTS = [
+    # 李娜：支付结算生产环境 编辑+密文；预发环境只给编辑（密文权仍独立）
+    ("lina", "pay", "*",       1, 1, "admin", 6),
+    # 王强：用户增长生产 编辑+密文
+    ("wangqiang", "growth", "prod", 1, 1, "admin", 6),
+    # 陈晨：预发可看明文；生产默认无密文权（她负责的应用也能改，但看不到生产明文）
+    ("chenchen", "growth", "staging", 1, 1, "admin", 4),
+    # 赵敏：供应链生产 编辑+密文
+    ("zhaomin", "supply", "prod", 1, 1, "liuyang", 7),
+    # 孙磊：数据平台全部环境 编辑+密文
+    ("sunlei", "data", "*", 1, 1, "admin", 6),
+    # 周婷：只读观察者，仅数据平台·生产，脱敏查看，不能编辑、不能看明文
+    ("zhouting", "data", "prod", 0, 0, "admin", 10),
+    # 钱一：只读观察者，仅用户增长·生产；授予查看 + 密文明文，但角色封顶永远不能编辑
+    # —— 用来演示"只能看某条业务线的生产环境"以及"能看明文 ≠ 能改"
+    ("qianyi", "growth", "prod", 0, 1, "admin", 3),
 ]
 
 # (应用名, 业务线, 负责人 username 或 None, 集群, 环境, 状态, 描述, 环境变量数, 距今天数)
@@ -55,10 +83,10 @@ APPS = [
     ("旧采购系统",      "supply", "liuyang",  "西南灾备集群", "prod", "offline",     "采购 1.0，已下线", 2, 90),
     # 数据平台
     ("实时数仓",        "data",   "sunlei",   "华北2集群", "prod",    "online",      "Flink 实时数仓", 6, 1),
-    ("离线调度平台",    "data",   "zhouting", "华北2集群", "prod",    "maintenance", "离线任务调度", 4, 9),
+    ("离线调度平台",    "data",   "sunlei",   "华北2集群", "prod",    "maintenance", "离线任务调度", 4, 2),
     ("BI 报表平台",     "data",   "sunlei",   "华东1集群", "prod",    "online",      "经营分析报表", 3, 25),
     ("数据质量中心",    "data",   None,       "华南1集群", "dev",     "developing",  "数据质量规则引擎", 0, 0),
-    ("标签画像平台",    "data",   "zhouting", "华东1集群", "staging", "online",      "用户标签与画像", 5, 4),
+    ("标签画像平台",    "data",   "sunlei",   "华东1集群", "staging", "online",      "用户标签与画像", 5, 4),
     ("日志采集 Agent",  "data",   "sunlei",   "西南灾备集群", "prod", "offline",     "已被 Filebeat 方案替代", 2, 120),
 ]
 
@@ -92,6 +120,22 @@ def seed_if_empty() -> bool:
         )
         user_ids[username] = cur.lastrowid
 
+    now0 = int(time.time())
+    # 业务线×环境 授权（密文权与编辑权分开授予）
+    grant_ids: dict[tuple, int] = {}
+    for username, bl_code, env, can_edit, can_reveal, granter, days_ago in GRANTS:
+        ts = now0 - days_ago * DAY
+        cur = execute(
+            """INSERT INTO user_grants
+               (user_id, business_line_id, environment, can_view_config,
+                can_edit_config, can_reveal, granted_by, created_at, updated_at)
+               VALUES (?,?,?,1,?,?,?,?,?)""",
+            (user_ids[username], bl_ids[bl_code], env,
+             1 if can_edit else 0, 1 if can_reveal else 0,
+             user_ids[granter], ts, ts),
+        )
+        grant_ids[(username, bl_code, env)] = cur.lastrowid
+
     app_ids: dict[str, int] = {}
     for (app_name, bl_code, owner, cluster, env, status, desc,
          env_count, days_ago) in APPS:
@@ -123,6 +167,7 @@ def seed_if_empty() -> bool:
             )
 
     seed_config_profiles(app_ids, user_ids, now)
+    seed_transfers(app_ids, user_ids, bl_ids, now)
     return True
 
 
@@ -213,6 +258,22 @@ CONFIG_PROFILES = [
             _cfg("LOG_LEVEL", "INFO"),
         ]),
     ]),
+    # 离线调度平台：经历过负责人交接（周婷 → 孙磊），配置与版本随应用一并移交、连续可溯
+    ("离线调度平台", "prod", [
+        ("zhouting", "离线调度平台生产初始配置", 30, [
+            _cfg("SCHEDULER_DB", "mysql-scheduler.data.internal"),
+            _cfg("SCHEDULER_DB_PASSWORD", "sched-init-pwd", is_secret=1),
+            _cfg("MAX_PARALLEL_JOBS", "128", "number"),
+            _cfg("LOG_LEVEL", "INFO"),
+        ]),
+        ("sunlei", "接手后轮换调度库口令、提高并发上限", 1, [
+            _cfg("SCHEDULER_DB", "mysql-scheduler.data.internal"),
+            _cfg("SCHEDULER_DB_PASSWORD", "sched-rot-0918", is_secret=1),
+            _cfg("MAX_PARALLEL_JOBS", "192", "number"),
+            _cfg("LOG_LEVEL", "INFO"),
+            _cfg("ALERT_WEBHOOK", "https://oncall.data.internal/hook"),
+        ]),
+    ]),
 ]
 
 
@@ -296,3 +357,51 @@ def seed_config_profiles(app_ids: dict, user_ids: dict, now: int) -> None:
                  "线上支付失败率升高，排查数据库连接鉴权问题，工单 INC-20260918-07",
                  now - DAY),
             )
+
+
+def seed_transfers(app_ids: dict, user_ids: dict, bl_ids: dict, now: int) -> None:
+    """写入一条应用交接留痕（周婷转岗 → 孙磊接手离线调度平台）与若干权限变更留痕样例。
+
+    交接的是应用归属与配置管理权限：配置项、历史版本、逐键留痕都挂在 app_id 上随应用移交，
+    这里只补登记交接事实（app_transfers + change_logs + permission_logs）。
+    """
+    def permlog(actor, target, action, scope_text, detail, ts):
+        execute(
+            """INSERT INTO permission_logs
+               (actor_id, target_user_id, action, scope_text, detail, created_at)
+               VALUES (?,?,?,?,?,?)""",
+            (user_ids[actor], user_ids[target], action, scope_text, detail, ts),
+        )
+
+    # 授权类留痕样例（与 GRANTS 对应，演示"权限变更本身进留痕"）
+    permlog("admin", "qianyi", "grant", "用户增长 · 生产",
+            "授予 钱一 在「用户增长 · 生产」的权限：配置查看（脱敏）、密文查看明文（只读观察者不可编辑）",
+            now - 3 * DAY)
+    permlog("admin", "zhouting", "grant", "数据平台 · 生产",
+            "授予 周婷 在「数据平台 · 生产」的权限：配置查看（脱敏）",
+            now - 10 * DAY)
+    permlog("liuyang", "zhaomin", "grant", "供应链 · 生产",
+            "授予 赵敏 在「供应链 · 生产」的权限：配置查看（脱敏）、配置编辑、密文查看明文",
+            now - 7 * DAY)
+
+    app_id = app_ids.get("离线调度平台")
+    if not app_id:
+        return
+    ts = now - 2 * DAY
+    note = "周婷转岗至数据治理组，离线调度平台及其全部环境配置、历史版本与密文授权责任移交孙磊"
+    execute(
+        """INSERT INTO app_transfers
+           (app_id, old_owner_id, new_owner_id, transfer_by_id, note, created_at)
+           VALUES (?,?,?,?,?,?)""",
+        (app_id, user_ids["zhouting"], user_ids["sunlei"], user_ids["admin"], note, ts),
+    )
+    execute(
+        "INSERT INTO change_logs (app_id, user_id, action, detail, created_at) VALUES (?,?,?,?,?)",
+        (app_id, user_ids["admin"], "应用交接",
+         "应用交接：负责人 周婷 → 孙磊；交接备注：" + note
+         + "；配置项与全部历史版本、留痕随应用一并移交", ts),
+    )
+    permlog("admin", "sunlei", "transfer", "应用「离线调度平台」",
+            "应用交接：负责人 周婷 → 孙磊；交接前负责人：周婷，交接后负责人：孙磊；"
+            "配置项随应用一并移交" + ("；交接备注：" + note if note else ""), ts)
+

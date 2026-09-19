@@ -26,6 +26,17 @@ TERMINAL_STATUS = "offline"
 
 CLUSTERS = ["华东1集群", "华北2集群", "华南1集群", "西南灾备集群"]
 
+# 角色体系：平台管理员 / 业务线负责人 / 应用负责人 / 只读观察者
+ROLES = ["admin", "bl_owner", "app_owner", "viewer"]
+ROLE_LABELS = {
+    "admin": "平台管理员",
+    "bl_owner": "业务线负责人",
+    "app_owner": "应用负责人",
+    "viewer": "只读观察者",
+}
+# 授权范围中的"全部环境"哨兵值
+ENV_SCOPE_ALL = "*"
+
 # 配置档案（按 应用 + 环境 管理）
 CONFIG_TYPES = ["string", "number", "boolean", "json"]
 CONFIG_TYPE_LABELS = {"string": "字符串", "number": "数字", "boolean": "布尔", "json": "JSON"}
@@ -48,9 +59,51 @@ CREATE TABLE IF NOT EXISTS users (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     username         TEXT NOT NULL UNIQUE,
     name             TEXT NOT NULL,
-    role             TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('admin', 'member')),
-    business_line_id INTEGER REFERENCES business_lines(id),
+    -- admin 平台管理员 / bl_owner 业务线负责人 / app_owner 应用负责人 / viewer 只读观察者
+    role             TEXT NOT NULL DEFAULT 'viewer'
+                     CHECK (role IN ('admin', 'bl_owner', 'app_owner', 'viewer')),
+    business_line_id INTEGER REFERENCES business_lines(id),  -- 业务线负责人/应用负责人的所属业务线；管理员与观察者可为空
     token            TEXT NOT NULL UNIQUE
+);
+
+-- 可见范围授权：按 业务线 × 环境 两级收窄。
+-- environment='*' 表示该业务线全部环境；具体环境（dev/test/staging/prod）表示仅该环境。
+-- 密文查看权 can_reveal 与 配置编辑权 can_edit 分开授予：能看明文不等于能改。
+CREATE TABLE IF NOT EXISTS user_grants (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id          INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    business_line_id INTEGER NOT NULL REFERENCES business_lines(id) ON DELETE CASCADE,
+    environment      TEXT NOT NULL DEFAULT '*'
+                     CHECK (environment IN ('*','dev','test','staging','prod')),
+    can_view_config  INTEGER NOT NULL DEFAULT 1 CHECK (can_view_config IN (0,1)),
+    can_edit_config  INTEGER NOT NULL DEFAULT 0 CHECK (can_edit_config IN (0,1)),
+    can_reveal       INTEGER NOT NULL DEFAULT 0 CHECK (can_reveal IN (0,1)),
+    granted_by       INTEGER REFERENCES users(id),
+    created_at       INTEGER NOT NULL,
+    updated_at       INTEGER NOT NULL,
+    UNIQUE (user_id, business_line_id, environment)
+);
+
+-- 应用归属交接留痕：交接的是应用归属与配置管理权限，配置项随应用一并移交
+CREATE TABLE IF NOT EXISTS app_transfers (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    app_id           INTEGER NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
+    old_owner_id     INTEGER REFERENCES users(id),
+    new_owner_id     INTEGER REFERENCES users(id),
+    transfer_by_id   INTEGER REFERENCES users(id),   -- 发起/确认交接的人
+    note             TEXT NOT NULL DEFAULT '',
+    created_at       INTEGER NOT NULL
+);
+
+-- 权限与交接类留痕（授权/收权/角色调整等，不只属于单个应用，独立于 change_logs）
+CREATE TABLE IF NOT EXISTS permission_logs (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    actor_id         INTEGER REFERENCES users(id),       -- 操作人（谁改的权限）
+    target_user_id   INTEGER REFERENCES users(id),       -- 被改权限的账号
+    action           TEXT NOT NULL,                       -- grant/revoke/role_change/transfer
+    scope_text       TEXT NOT NULL DEFAULT '',            -- 业务线/环境/应用的文字描述
+    detail           TEXT NOT NULL DEFAULT '',            -- 具体变化（授了什么、收了什么）
+    created_at       INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS applications (
@@ -113,9 +166,7 @@ CREATE TABLE IF NOT EXISTS config_versions (
     created_by  INTEGER REFERENCES users(id),
     created_at  INTEGER NOT NULL,
     UNIQUE (app_id, environment, version)
-);
-
--- 配置留痕：逐键流水（改前/改后/操作人/理由），只追加，不更新不删除
+);-- 配置留痕：逐键流水（改前/改后/操作人/理由），只追加，不更新不删除
 CREATE TABLE IF NOT EXISTS config_audit_logs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     app_id      INTEGER NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
@@ -135,6 +186,11 @@ CREATE INDEX IF NOT EXISTS idx_apps_bl ON applications(business_line_id);
 CREATE INDEX IF NOT EXISTS idx_apps_owner ON applications(owner_id);
 CREATE INDEX IF NOT EXISTS idx_logs_app ON change_logs(app_id);
 CREATE INDEX IF NOT EXISTS idx_logs_time ON change_logs(created_at);
+CREATE INDEX IF NOT EXISTS idx_grants_user ON user_grants(user_id);
+CREATE INDEX IF NOT EXISTS idx_grants_bl_env ON user_grants(business_line_id, environment);
+CREATE INDEX IF NOT EXISTS idx_transfers_app ON app_transfers(app_id);
+CREATE INDEX IF NOT EXISTS idx_permlogs_target ON permission_logs(target_user_id);
+CREATE INDEX IF NOT EXISTS idx_permlogs_time ON permission_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_cfg_app_env ON config_items(app_id, environment);
 CREATE INDEX IF NOT EXISTS idx_ver_app_env ON config_versions(app_id, environment);
 CREATE INDEX IF NOT EXISTS idx_audit_app ON config_audit_logs(app_id);
@@ -159,7 +215,53 @@ def get_conn() -> sqlite3.Connection:
 def init_db() -> None:
     conn = get_conn()
     conn.executescript(SCHEMA)
+    _migrate_legacy(conn)
     conn.commit()
+
+
+def _migrate_legacy(conn) -> None:
+    """旧版库（users.role 仅 admin/member）平滑升级到四角色体系。
+
+    SQL 的 CREATE TABLE IF NOT EXISTS 不会更新既有表约束，这里检测到旧表后
+    手工重建 users，并为旧成员补一条"整条业务线全权"授权，保持迁移前能力。
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='users'"
+    ).fetchone()
+    if not row or "'member'" not in (row["sql"] or ""):
+        return
+    now = int(__import__("time").time())
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute("ALTER TABLE users RENAME TO users_legacy")
+    conn.execute(
+        """CREATE TABLE users (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            username         TEXT NOT NULL UNIQUE,
+            name             TEXT NOT NULL,
+            role             TEXT NOT NULL DEFAULT 'viewer'
+                             CHECK (role IN ('admin', 'bl_owner', 'app_owner', 'viewer')),
+            business_line_id INTEGER REFERENCES business_lines(id),
+            token            TEXT NOT NULL UNIQUE
+        )"""
+    )
+    conn.execute(
+        """INSERT INTO users (id, username, name, role, business_line_id, token)
+           SELECT id, username, name,
+                  CASE role WHEN 'admin' THEN 'admin' ELSE 'app_owner' END,
+                  business_line_id, token
+           FROM users_legacy"""
+    )
+    conn.execute(
+        """INSERT INTO user_grants
+               (user_id, business_line_id, environment,
+                can_view_config, can_edit_config, can_reveal, granted_by, created_at, updated_at)
+           SELECT id, business_line_id, '*', 1, 1, 1, id, ?, ?
+           FROM users_legacy WHERE role <> 'admin' AND business_line_id IS NOT NULL""",
+        (now, now),
+    )
+    conn.execute("DROP TABLE users_legacy")
+    conn.execute("PRAGMA foreign_keys=ON")
+
 
 
 def query(sql: str, params: tuple = ()) -> list:

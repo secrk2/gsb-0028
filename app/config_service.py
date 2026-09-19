@@ -24,6 +24,19 @@ KEY_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_.\-]{0,127}$")
 class NoChangeError(ValueError):
     """配置与当前值完全一致，不产生空版本。"""
 
+
+class VersionConflictError(Exception):
+    """乐观锁冲突：后来者手里的基线版本已过期，不能静默盖掉前一个改动。
+
+    payload 携带服务器当前版本信息与"基线 → 服务器当前"的逐键差异，
+    供前端弹出冲突框让用户取舍（放弃我的改动 / 看清差异后基于最新版重新合并）。
+    """
+
+    def __init__(self, payload: dict):
+        super().__init__(payload["message"])
+        self.payload = payload
+
+
 ACTION_LABELS = {
     "add": "新增",
     "update": "修改",
@@ -137,19 +150,82 @@ def write_app_change_log(conn, app_id: int, user_id: int, text: str) -> None:
     )
 
 
+def _version_meta(conn, app_id: int, environment: str):
+    """最新版本号及其元数据（无版本时返回 (0, None)）。"""
+    row = conn.execute(
+        """SELECT v.*, u.name AS created_by_name
+           FROM config_versions v LEFT JOIN users u ON u.id = v.created_by
+           WHERE v.app_id = ? AND v.environment = ?
+           ORDER BY v.version DESC LIMIT 1""",
+        (app_id, environment),
+    ).fetchone()
+    if not row:
+        return 0, None
+    return row["version"], dict(row)
+
+
+def build_conflict_payload(app_id: int, environment: str, expected: int, latest_no: int,
+                           latest_meta: dict, conn=None) -> dict:
+    """构造 409 冲突响应：服务器当前版本信息 + 基线版→服务器当前版的逐键差异。"""
+    my_conn = conn or get_conn()
+    base = my_conn.execute(
+        "SELECT snapshot FROM config_versions WHERE app_id=? AND environment=? AND version=?",
+        (app_id, environment, expected),
+    ).fetchone()
+    latest = my_conn.execute(
+        "SELECT snapshot FROM config_versions WHERE app_id=? AND environment=? AND version=?",
+        (app_id, environment, latest_no),
+    ).fetchone()
+    base_items = json.loads(base["snapshot"]) if base else []
+    latest_items = json.loads(latest["snapshot"]) if latest else []
+    # 方向：a=你打开时的基线版，b=服务器上已被别人改出的新版
+    entries = diff_item_lists(base_items, latest_items)
+    return {
+        "code": "config_version_conflict",
+        "message": (
+            f"配置已被他人更新：你打开编辑时基于 v{expected}，但服务器当前已是 v{latest_no}"
+            f"（{latest_meta.get('created_by_name') or '系统'} 于 "
+            f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(latest_meta['created_at']))} 保存"
+            + (f"，备注：{latest_meta['change_note']}" if latest_meta.get("change_note") else "")
+            + "）。为避免后来者静默覆盖前一个改动，本次保存已被拒绝；"
+              "请查看差异后选择「放弃我的改动」或「基于最新版重新合并」。"
+        ),
+        "environment": environment,
+        "base_version": expected,
+        "current_version": latest_no,
+        "current_version_meta": {
+            "version": latest_no,
+            "change_note": latest_meta.get("change_note", ""),
+            "created_by_name": latest_meta.get("created_by_name") or "系统",
+            "created_at": latest_meta["created_at"],
+        },
+        "entries": entries,
+        "summary": summarize_diff(entries),
+    }
+
+
 # ---------------------------------------------------------------- 保存（产生版本 + 留痕）
 
 def save_profile(app_id: int, environment: str, items: list[dict], user: dict,
-                 change_note: str = "", rollback_from: int | None = None) -> dict:
+                 change_note: str = "", rollback_from: int | None = None,
+                 expected_version: int | None = None) -> dict:
     """整体保存某应用某环境的配置档案。
 
     与旧值逐键 diff 写留痕；无任何变化时拒绝产生空版本。
     rollback_from 不为 None 时，留痕动作记为 rollback，且这是一次"追加"而非覆盖。
+    expected_version 为编辑者打开页面时的基线版本号；与服务器最新版不一致即乐观锁冲突（409），
+    绝不允许后来者静默盖掉前一个改动。
     """
     note = change_note.strip() if change_note else ""
     conn = get_conn()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        latest_no, latest_meta = _version_meta(conn, app_id, environment)
+        if expected_version is not None and expected_version != latest_no:
+            raise VersionConflictError(
+                build_conflict_payload(app_id, environment, expected_version,
+                                       latest_no, latest_meta, conn)
+            )
         old_rows = conn.execute(
             "SELECT * FROM config_items WHERE app_id = ? AND environment = ?",
             (app_id, environment),
@@ -242,7 +318,8 @@ def save_profile(app_id: int, environment: str, items: list[dict], user: dict,
         raise
 
 
-def rollback(app_id: int, environment: str, version_no: int, user: dict) -> dict:
+def rollback(app_id: int, environment: str, version_no: int, user: dict,
+             expected_version: int | None = None) -> dict:
     target = query_one(
         "SELECT * FROM config_versions WHERE app_id = ? AND environment = ? AND version = ?",
         (app_id, environment, version_no),
@@ -254,7 +331,8 @@ def rollback(app_id: int, environment: str, version_no: int, user: dict) -> dict
         raise ValueError(f"v{version_no} 就是当前版本，无需回滚")
     items = validate_items(json.loads(target["snapshot"]))
     return save_profile(app_id, environment, items, user,
-                        change_note=target["change_note"], rollback_from=version_no)
+                        change_note=target["change_note"], rollback_from=version_no,
+                        expected_version=expected_version)
 
 
 # ---------------------------------------------------------------- 环境对比
@@ -414,10 +492,11 @@ def _date_to_epoch(value: str | None, end: bool = False) -> int | None:
 def query_audit(user: dict, *, app_id: int | None = None, business_line_id: int | None = None,
                 environment: str | None = None, action: str | None = None,
                 start: str | None = None, end: str | None = None) -> tuple[str, list]:
-    """返回 (sql, params)，已强制业务线数据范围。"""
+    """返回 (sql, params)，已强制 业务线×环境 + 应用归属 的可见范围。"""
+    from . import permissions as perms
     sql = """SELECT l.id, l.app_id, l.environment, l.version_id, l.action, l.config_key,
                     l.old_value, l.new_value, l.is_secret, l.reason, l.created_at,
-                    a.name AS app_name, b.id AS business_line_id, b.name AS business_line_name,
+                    a.name AS app_name, a.owner_id, b.id AS business_line_id, b.name AS business_line_name,
                     u.name AS user_name
              FROM config_audit_logs l
              JOIN applications a ON a.id = l.app_id
@@ -425,12 +504,18 @@ def query_audit(user: dict, *, app_id: int | None = None, business_line_id: int 
              LEFT JOIN users u ON u.id = l.user_id
              WHERE 1=1"""
     params: list = []
-    if user["role"] != "admin":
-        sql += " AND a.business_line_id = ?"
-        params.append(user["business_line_id"])
-    elif business_line_id:
-        sql += " AND a.business_line_id = ?"
-        params.append(business_line_id)
+    if perms.is_admin(user):
+        if business_line_id:
+            sql += " AND a.business_line_id = ?"
+            params.append(business_line_id)
+    else:
+        # 显式按范围外业务线筛选：交由路由层先做越权判定；这里强制注入可见范围条件
+        cond, cond_params = perms.scope_condition(user, "a.business_line_id", "l.environment", "a.owner_id")
+        sql += f" AND {cond}"
+        params.extend(cond_params)
+        if business_line_id:
+            sql += " AND a.business_line_id = ?"
+            params.append(business_line_id)
     if app_id:
         sql += " AND l.app_id = ?"
         params.append(app_id)

@@ -284,6 +284,11 @@ button { font-family: inherit; }
 .env-tab:hover { border-color: var(--brand); color: var(--brand); }
 .env-tab.active { background: var(--brand); border-color: var(--brand); color: #fff; }
 .env-tab.prod.active { background: #c02f33; border-color: #c02f33; }
+.env-tab.disabled {
+  opacity: .55; cursor: not-allowed; background: #f2f4f8;
+  border-style: dashed; text-decoration: none;
+}
+.env-tab.disabled:hover { border-color: var(--line); color: var(--ink-3); }
 .cfg-grid { grid-template-columns: 1.6fr 1fr; }
 .cfg-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
 
@@ -385,3 +390,69 @@ button { font-family: inherit; }
   .lc-label { display: none; }
   .page-head h2 { font-size: 17px; }
 }
+
+/* ==================== 权限与交接（本轮新增） ==================== */
+
+/* 顶部用户条：角色徽标 + 可见范围 */
+.user-chip .chip-main { display: inline-flex; align-items: center; gap: 6px; }
+.user-chip .chip-scope {
+  max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 12px; color: #9fb0c8;
+}
+
+/* 四角色徽标（登录页 / 用户条 / 人员表） */
+.u-role.role-admin     { background: #e8f0ff; color: #2f6bff; }
+.u-role.role-bl_owner  { background: #e5f8ee; color: #0f8a4c; }
+.u-role.role-app_owner { background: #fdf3d7; color: #ad7209; }
+.u-role.role-viewer    { background: #eceff3; color: #6b7686; }
+.u-role {
+  display: inline-block; font-size: 11px; padding: 1px 8px; border-radius: 999px;
+  background: #eef1f6; color: var(--ink-2); white-space: nowrap;
+}
+
+/* 无编辑/明文权时的原因提示条 */
+.perm-notice {
+  margin-bottom: 12px; font-size: 13px; color: #6b7686;
+  background: #f2f4f8; border-left: 3px solid #8a94a6;
+}
+.perm-notice.warn { background: #fdf6ec; border-left-color: #d98e04; color: #8a5a00; }
+.perm-notice b { color: var(--ink); }
+
+.field-hint { font-size: 11px; color: var(--ink-3); margin-top: 4px; }
+
+/* 管理页 tab */
+.admin-tabs { display: flex; gap: 6px; margin-bottom: 14px; flex-wrap: wrap; }
+.adm-tab {
+  padding: 7px 18px; border-radius: 8px; border: 1px solid var(--line);
+  background: #fff; color: var(--ink-2); font-size: 13px; cursor: pointer;
+}
+.adm-tab.active { background: var(--brand); border-color: var(--brand); color: #fff; }
+
+/* 授权表单中的复选项 */
+.chk { display: inline-flex; align-items: center; gap: 5px; font-size: 13px; color: var(--ink); white-space: nowrap; }
+.chk input { margin: 0; }
+
+/* 交接记录里的备注与责任说明 */
+.transfer-item { border-left: 3px solid var(--brand); padding-left: 10px; }
+.transfer-note { font-size: 12px; color: var(--ink-2); margin: 3px 0; }
+
+/* 并发编辑冲突弹窗 */
+.conflict-meta {
+  font-size: 13px; color: var(--ink-2); background: #f7f9fc;
+  border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; margin-bottom: 10px;
+}
+.conflict-hint {
+  font-size: 12px; color: #8a5a00; background: #fdf6ec; border: 1px solid #f0d59a;
+  border-radius: 8px; padding: 7px 12px; margin-bottom: 8px;
+}
+.row-conflict td { background: #fde8e8 !important; }
+.ver-base {
+  font-size: 11px; font-weight: 400; color: var(--ink-3);
+  border: 1px solid var(--line); border-radius: 6px; padding: 1px 7px; margin-left: 8px;
+}
+
+/* 权限留痕动作色 */
+.action-tag.role_change { background: #e8f0ff; color: #2f6bff; }
+.action-tag.transfer    { background: #eafaf1; color: #0f8a4c; }
+.action-tag.revoke      { background: #fde8e8; color: #c02f33; }
+.action-tag.grant       { background: #e5f8ee; color: #0f8a4c; }
