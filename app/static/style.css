@@ -385,3 +385,55 @@ button { font-family: inherit; }
   .lc-label { display: none; }
   .page-head h2 { font-size: 17px; }
 }
+
+/* ==================== 权限与交接（本轮新增） ==================== */
+.btn.warn { color: #b45309; border-color: #f3d8a3; background: #fff8ec; }
+.btn.warn:hover { background: #fdeecd; border-color: #d9971f; }
+.btn.primary.warn, .btn.warn.primary { background: #d97706; border-color: #d97706; color: #fff; }
+.btn.primary.warn:hover { background: #b45309; color: #fff; }
+
+.chip-role {
+  display: inline-block; font-size: 11px; padding: 1px 8px; border-radius: 999px;
+  background: #e8f0ff; color: var(--brand); margin-right: 4px;
+}
+
+.perm-hint {
+  align-self: center; font-size: 12px; color: var(--ink-3);
+  background: #f6f7fa; border: 1px dashed var(--line); border-radius: 8px; padding: 6px 12px;
+}
+
+.perm-banner {
+  margin-bottom: 14px; border-left: 3px solid #d97706;
+  background: #fff8ec; color: #92600a; font-size: 13px;
+}
+.perm-banner b { color: #7c4a06; }
+
+.env-tab.locked {
+  color: var(--ink-3); background: #f6f7fa; border-color: var(--line);
+  cursor: not-allowed; text-decoration: none;
+}
+
+.handover-item { padding: 8px 0; border-bottom: 1px dashed var(--line); }
+.handover-item:last-child { border-bottom: 0; }
+.ho-note { font-size: 12px; color: var(--ink-2); margin-top: 4px; background: #f6f7fa; border-radius: 6px; padding: 6px 8px; }
+
+.perm-user-list { display: flex; flex-direction: column; gap: 8px; max-height: 560px; overflow-y: auto; }
+.perm-user {
+  border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; cursor: pointer;
+  transition: border-color .15s, box-shadow .15s;
+}
+.perm-user:hover { border-color: var(--brand); box-shadow: 0 2px 10px rgba(53,94,184,.08); }
+.pu-head { display: flex; align-items: center; gap: 8px; }
+.pu-meta { font-size: 12px; color: var(--ink-3); margin-top: 3px; }
+
+.perm-table select { width: 100%; }
+.pe-note { font-size: 12px; color: var(--ink-3); margin: 4px 0 0; }
+.check-line { display: flex; align-items: flex-start; gap: 8px; font-size: 13px; color: var(--ink-2); font-weight: 400; }
+.check-line input { margin-top: 3px; }
+
+.cf-ver {
+  font-size: 13px; color: var(--ink-2); background: #f6f7fa;
+  border-radius: 8px; padding: 6px 10px; margin-bottom: 6px;
+}
+.log-detail { font-size: 13px; color: var(--ink-1); margin: 2px 0; }
+.user-chip .chip-role { background: rgba(255,255,255,.16); color: #fff; }

@@ -8,10 +8,41 @@ const state = {
   businessLines: [],
   users: [],
   configMeta: null,
+  myPerms: null,
   filters: { business_line_id: "", owner_id: "", environment: "", status: "", q: "" },
-  configFilters: { app_id: "", environment: "" },
+  configFilters: { business_line_id: "", environment: "" },
   auditFilters: { app_id: "", business_line_id: "", environment: "", action: "", start: "", end: "" },
 };
+
+/* ---------------- 权限 helper ---------------- */
+function isAdmin() {
+  return state.user && state.user.role === "admin";
+}
+function roleLabelOf(u) {
+  return (u && (u.role_label || (state.configMeta && state.configMeta.roles || [])
+    .find((r) => r.value === u.role)?.label)) || u?.role || "";
+}
+// 当前账号在某 业务线×环境 是否可见 / 是否持有某权限位
+function accessAt(blId, env) {
+  if (isAdmin()) {
+    return { can_view_secret: true, can_edit_config: true, can_manage_app: true };
+  }
+  const rows = (state.myPerms && state.myPerms.access) || [];
+  return rows.find((a) => String(a.business_line_id) === String(blId) && a.environment === env) || null;
+}
+function canAt(blId, env, perm) {
+  if (isAdmin()) return true;
+  const a = accessAt(blId, env);
+  return !!(a && a[perm]);
+}
+function envVisible(blId, env) {
+  if (isAdmin()) return true;
+  return !!accessAt(blId, env);
+}
+function hasAnyPerm(perm) {
+  if (isAdmin()) return true;
+  return ((state.myPerms && state.myPerms.access) || []).some((a) => a[perm]);
+}
 
 /* ---------------- 工具 ---------------- */
 const $ = (sel, root) => (root || document).querySelector(sel);
@@ -58,10 +89,15 @@ async function api(path, opts = {}) {
   let data = null;
   try { data = await res.json(); } catch (e) { /* ignore */ }
   if (!res.ok) {
-    const message = (data && data.detail) || `请求失败（HTTP ${res.status}）`;
+    let message = `请求失败（HTTP ${res.status}）`;
+    if (data) {
+      if (typeof data.detail === "string") message = data.detail;
+      else if (data.detail && typeof data.detail === "object" && data.detail.message) message = data.detail.message;
+    }
     if (res.status === 401) { logout(false); }
     const error = new Error(message);
     error.status = res.status;
+    error.data = data;   // 结构化错误体（如 409 乐观锁冲突详情）
     throw error;
   }
   return data;
@@ -95,7 +131,7 @@ async function showLogin() {
       <div class="login-user" data-username="${esc(u.username)}">
         <div class="u-name">${esc(u.name)}</div>
         <div class="u-meta">${esc(u.business_line_name || "平台")}</div>
-        <span class="u-role ${u.role === "admin" ? "admin" : ""}">${u.role === "admin" ? "管理员" : "业务成员"}</span>
+        <span class="u-role ${u.role === "admin" ? "admin" : ""}">${esc(u.role_label || u.role)}</span>
       </div>`).join("");
     $$(".login-user", box).forEach((el) => {
       el.onclick = () => doLogin(el.dataset.username);
@@ -131,22 +167,36 @@ function logout(showTip = true) {
 async function bootstrap() {
   try {
     if (!state.user) state.user = await api("/api/me");
-    const [meta, bls, usrs, cfgMeta] = await Promise.all([
-      api("/api/meta"), api("/api/business-lines"), api("/api/users"), api("/api/config/meta"),
+    const [meta, bls, usrs, cfgMeta, myPerms] = await Promise.all([
+      api("/api/meta"), api("/api/business-lines"), api("/api/users"),
+      api("/api/config/meta"), api("/api/my/permissions"),
     ]);
     state.meta = meta;
     state.businessLines = bls;
     state.users = usrs;
     state.configMeta = cfgMeta;
+    state.myPerms = myPerms;
   } catch (e) {
     if (e.status !== 401) toast(e.message, "error");
     return;
   }
   $("#topnav").hidden = false;
+  // 平台管理员与业务线负责人可见「权限与交接」
+  if (canManagePermissions()) {
+    if (!$("#nav-perms")) {
+      $("#topnav").insertAdjacentHTML(
+        "beforeend", '<a href="#/perms" data-route="perms" id="nav-perms">权限与交接</a>');
+    }
+  } else {
+    const a = $("#nav-perms");
+    if (a) a.remove();
+  }
   const chip = $("#user-chip");
   chip.hidden = false;
+  const rl = state.user.role_label || roleLabelOf(state.user);
   chip.innerHTML = `
-    <span>${esc(state.user.name)} · ${esc(state.user.business_line_name || "平台")}${state.user.role === "admin" ? "（管理员）" : ""}</span>
+    <span class="chip-role">${esc(rl)}</span>
+    <span>${esc(state.user.name)} · ${esc(state.user.business_line_name || "平台")}</span>
     <button class="logout" id="btn-logout">退出</button>`;
   $("#btn-logout").onclick = () => logout();
   route();
@@ -163,6 +213,7 @@ function route() {
     if (parts[1]) renderConfigProfile(parts[1], parts[2] || "");
     else renderConfigList();
   } else if (parts[0] === "audit") renderAudit();
+  else if (parts[0] === "perms") renderPermsPage();
   else renderConsole();
 }
 
@@ -186,7 +237,7 @@ async function renderConsole() {
     <div class="page-head">
       <div>
         <h2>资产控制台</h2>
-        <div class="sub">${state.user.role === "admin" ? "全部业务线" : "本业务线"}应用资产概览</div>
+        <div class="sub">${isAdmin() ? "全部业务线 · 全部环境" : esc(state.myPerms ? state.myPerms.scope_text : "授权范围")} · 应用资产概览</div>
       </div>
     </div>
 
@@ -261,18 +312,25 @@ async function renderConsole() {
 async function renderApps() {
   const view = $("#view");
   const f = state.filters;
-  const isAdmin = state.user.role === "admin";
+  const admin = isAdmin();
+  // 非管理员：环境下拉只保留自己被授权过的环境
+  const myEnvs = admin
+    ? state.meta.environments
+    : state.meta.environments.filter((e) =>
+        (state.myPerms.access || []).some((a) => a.environment === e.value));
+  const canCreate = admin || hasAnyPerm("can_manage_app");
 
   view.innerHTML = `
     <div class="page-head">
       <div>
         <h2>应用台账</h2>
-        <div class="sub">${isAdmin ? "全部业务线" : esc(state.user.business_line_name || "")} · 支持业务线 / 负责人 / 环境 / 状态组合筛选</div>
+        <div class="sub">${admin ? "全部业务线 · 全部环境" : esc(state.myPerms.scope_text)} · 支持业务线 / 负责人 / 环境 / 状态组合筛选</div>
       </div>
-      <button class="btn primary" id="btn-new-app">+ 新建应用</button>
+      ${canCreate ? '<button class="btn primary" id="btn-new-app">+ 新建应用</button>'
+                  : '<span class="perm-hint">只读账号无新建权，如需开通请联系平台管理员</span>'}
     </div>
     <div class="panel filter-bar">
-      <select id="f-bl" ${isAdmin ? "" : "disabled"}>
+      <select id="f-bl" ${admin ? "" : "disabled"}>
         <option value="">全部业务线</option>
         ${state.businessLines.map((b) => `<option value="${b.id}" ${String(b.id) === String(f.business_line_id) ? "selected" : ""}>${esc(b.name)}</option>`).join("")}
       </select>
@@ -282,7 +340,7 @@ async function renderApps() {
       </select>
       <select id="f-env">
         <option value="">全部环境</option>
-        ${state.meta.environments.map((e) => `<option value="${e.value}" ${f.environment === e.value ? "selected" : ""}>${esc(e.label)}</option>`).join("")}
+        ${myEnvs.map((e) => `<option value="${e.value}" ${f.environment === e.value ? "selected" : ""}>${esc(e.label)}</option>`).join("")}
       </select>
       <select id="f-status">
         <option value="">全部状态</option>
@@ -401,6 +459,8 @@ async function renderAppDetail(appId) {
   const isOffline = app.status === "offline";
   const curIdx = STATUS_FLOW.indexOf(app.status);
   const nextStatuses = STATUS_FLOW.slice(curIdx + 1);
+  const perms = app.permissions || { can_manage_app: false };
+  const canManage = !!perms.can_manage_app;
 
   view.innerHTML = `
     <div class="page-head">
@@ -411,9 +471,15 @@ async function renderAppDetail(appId) {
       <div style="display:flex;gap:8px">
         <button class="btn" id="btn-back">← 返回台账</button>
         <button class="btn" id="btn-config">配置档案</button>
-        ${isOffline ? "" : '<button class="btn" id="btn-edit">编辑信息</button>'}
+        ${canManage && !isOffline ? '<button class="btn" id="btn-edit">编辑信息</button>' : ""}
+        ${canManage ? '<button class="btn warn" id="btn-handover">应用交接</button>' : ""}
       </div>
     </div>
+
+    ${!canManage ? `<div class="panel perm-banner">
+      <span>🔒 当前账号在「${esc(app.business_line_name)} · ${esc(app.environment_label)}」没有<b>应用管理权</b>：
+      可查看本页信息，但不能编辑、流转状态、改环境变量或发起交接。</span>
+    </div>` : ""}
 
     ${app.red_dots.length ? `<div class="panel panel-pad" style="margin-bottom:16px">
       <span style="margin-right:10px;color:var(--ink-2)">风险提示：</span>${redDotsHtml(app)}
@@ -433,7 +499,9 @@ async function renderAppDetail(appId) {
           </div>
           ${isOffline
             ? `<p style="color:var(--ink-3);font-size:13px">应用已下线（终态），所有信息只读，不能再变更。</p>`
-            : `<div class="status-actions">
+            : !canManage
+              ? `<p style="color:var(--ink-3);font-size:13px">当前账号无应用管理权，状态流转需负责人或管理员操作。</p>`
+              : `<div class="status-actions">
                 <span style="color:var(--ink-2);font-size:13px;align-self:center">流转到：</span>
                 ${nextStatuses.map((s) => {
                   const label = state.meta.statuses.find((x) => x.value === s).label;
@@ -461,14 +529,21 @@ async function renderAppDetail(appId) {
         </div>
       </div>
 
-      <div class="panel panel-pad">
-        <h3>变更记录</h3>
-        <div class="log-list">
-          ${app.change_logs.length ? app.change_logs.map((l) => `
-            <div class="log-item">
-              <div><b>${esc(l.action)}</b> · ${esc(l.detail)}</div>
-              <div class="log-meta">${esc(l.user_name || "系统")} · ${fmtTime(l.created_at)}</div>
-            </div>`).join("") : `<div class="empty-tip">暂无变更记录</div>`}
+      <div>
+        <div class="panel panel-pad" id="handover-panel" style="margin-bottom:16px">
+          <h3>交接留痕 <span style="font-weight:400;font-size:12px;color:var(--ink-3)">应用归属与权限的交接记录</span></h3>
+          <div id="handover-list"><div class="empty-tip">加载中…</div></div>
+        </div>
+
+        <div class="panel panel-pad">
+          <h3>变更记录</h3>
+          <div class="log-list">
+            ${app.change_logs.length ? app.change_logs.map((l) => `
+              <div class="log-item">
+                <div><b>${esc(l.action)}</b> · ${esc(l.detail)}</div>
+                <div class="log-meta">${esc(l.user_name || "系统")} · ${fmtTime(l.created_at)}</div>
+              </div>`).join("") : `<div class="empty-tip">暂无变更记录</div>`}
+          </div>
         </div>
       </div>
     </div>`;
@@ -477,15 +552,40 @@ async function renderAppDetail(appId) {
   $("#btn-config").onclick = () => { location.hash = `#/config/${app.id}/${app.environment}`; };
   const editBtn = $("#btn-edit");
   if (editBtn) editBtn.onclick = () => openAppModal(app);
+  const hoBtn = $("#btn-handover");
+  if (hoBtn) hoBtn.onclick = () => openHandoverModal(app);
   $$("[data-to-status]", view).forEach((btn) => {
     btn.onclick = () => transitionStatus(app.id, btn.dataset.toStatus);
   });
   renderEnvEditor(app);
+  loadHandovers(app.id);
+}
+
+async function loadHandovers(appId) {
+  const box = $("#handover-list");
+  if (!box) return;
+  try {
+    const rows = await api(`/api/apps/${appId}/handovers`);
+    if (!rows.length) {
+      box.innerHTML = `<div class="empty-tip">暂无交接记录</div>`;
+      return;
+    }
+    box.innerHTML = rows.map((h) => `
+      <div class="handover-item">
+        <div><b>${esc(h.from_name)}</b> → <b>${esc(h.to_name)}</b>
+          <span class="meta-tag">${fmtTime(h.effective_at)} 生效</span></div>
+        <div class="log-meta">交接原因：${esc(h.reason)} · 操作人：${esc(h.operator_name)}</div>
+        <div class="ho-note">${esc(h.permissions_note)}</div>
+      </div>`).join("");
+  } catch (e) {
+    box.innerHTML = `<div class="empty-tip">交接记录加载失败：${esc(e.message)}</div>`;
+  }
 }
 
 function renderEnvEditor(app) {
   const box = $("#env-editor");
-  const readOnly = app.status === "offline";
+  const noPerm = !(app.permissions && app.permissions.can_manage_app);
+  const readOnly = app.status === "offline" || noPerm;
   const rows = app.env_vars.map((v) => ({ ...v }));
   if (!rows.length) rows.push({ key: "", value: "" });
 
@@ -494,9 +594,11 @@ function renderEnvEditor(app) {
       <thead><tr><th style="width:38%">KEY</th><th>VALUE</th>${readOnly ? "" : '<th style="width:52px"></th>'}</tr></thead>
       <tbody id="env-tbody"></tbody>
     </table>
-    ${readOnly
+    ${app.status === "offline"
       ? `<p style="color:var(--ink-3);font-size:13px">应用已下线（终态），环境变量只读。</p>`
-      : `<div style="display:flex;gap:8px;margin-top:10px">
+      : noPerm
+        ? `<p style="color:var(--ink-3);font-size:13px">当前账号在该业务线×环境无应用管理权，环境变量只读；需要修改请联系负责人或平台管理员。</p>`
+        : `<div style="display:flex;gap:8px;margin-top:10px">
           <button class="btn small" id="env-add">+ 添加一行</button>
           <button class="btn primary small" id="env-save">保存环境变量</button>
         </div>`}`;
@@ -547,11 +649,26 @@ async function transitionStatus(appId, toStatus) {
 /* ---------------- 新建 / 编辑弹窗 ---------------- */
 function openAppModal(app) {
   const isEdit = !!app;
-  const isAdmin = state.user.role === "admin";
+  const admin = isAdmin();
   const root = $("#modal-root");
   const ownerOptions = (blId) => state.users
     .filter((u) => !blId || String(u.business_line_id) === String(blId))
     .map((u) => `<option value="${u.id}" ${app && app.owner_id === u.id ? "selected" : ""}>${esc(u.name)}</option>`).join("");
+  // 非管理员只能在自己持"应用管理权"的 业务线×环境 上新建
+  const manageableBLs = admin
+    ? state.businessLines.map((b) => b.id)
+    : [...new Set((state.myPerms.access || []).filter((a) => a.can_manage_app).map((a) => a.business_line_id))];
+  const blChoices = state.businessLines.filter((b) => manageableBLs.includes(b.id));
+  const envsForBL = (blId) => admin
+    ? state.meta.environments
+    : state.meta.environments.filter((e) => canAt(blId, e.value, "can_manage_app"));
+
+  const initBL = isEdit ? app.business_line_id
+    : (blChoices.find((b) => String(b.id) === String(state.filters.business_line_id))?.id
+       || blChoices[0]?.id);
+  const initEnv = isEdit ? app.environment
+    : (envsForBL(initBL).find((e) => e.value === state.filters.environment)?.value
+       || envsForBL(initBL)[0]?.value);
 
   root.innerHTML = `
     <div class="modal-mask">
@@ -564,13 +681,13 @@ function openAppModal(app) {
           </div>
           <div>
             <label>所属业务线 *</label>
-            <select id="m-bl" ${isEdit || !isAdmin ? "disabled" : ""}>
-              ${state.businessLines.map((b) => `<option value="${b.id}" ${isEdit && app.business_line_id === b.id ? "selected" : ""}>${esc(b.name)}</option>`).join("")}
+            <select id="m-bl" ${isEdit ? "disabled" : ""}>
+              ${blChoices.map((b) => `<option value="${b.id}" ${String(b.id) === String(initBL) ? "selected" : ""}>${esc(b.name)}</option>`).join("")}
             </select>
           </div>
           <div>
             <label>负责人</label>
-            <select id="m-owner"><option value="">（暂不指定）</option>${ownerOptions(isEdit ? app.business_line_id : state.businessLines[0].id)}</select>
+            <select id="m-owner"><option value="">（暂不指定）</option>${ownerOptions(initBL)}</select>
           </div>
           <div>
             <label>所属集群 *</label>
@@ -579,9 +696,10 @@ function openAppModal(app) {
             </select>
           </div>
           <div>
-            <label>环境 *</label>
+            <label>环境 *${isEdit ? "（改挂环境需在目标环境也有应用管理权）" : ""}</label>
             <select id="m-env">
-              ${state.meta.environments.map((e) => `<option value="${e.value}" ${isEdit && app.environment === e.value ? "selected" : ""}>${esc(e.label)}</option>`).join("")}
+              ${(isEdit ? state.meta.environments : envsForBL(initBL)).map((e) =>
+                `<option value="${e.value}" ${initEnv === e.value ? "selected" : ""}>${esc(e.label)}</option>`).join("")}
             </select>
           </div>
           <div class="full">
@@ -602,8 +720,12 @@ function openAppModal(app) {
   $(".modal-mask", root).onclick = (e) => { if (e.target.classList.contains("modal-mask")) close(); };
 
   const blSel = $("#m-bl");
+  const envSel = $("#m-env");
   if (!isEdit) {
-    blSel.onchange = () => { $("#m-owner").innerHTML = `<option value="">（暂不指定）</option>` + ownerOptions(blSel.value); };
+    blSel.onchange = () => {
+      $("#m-owner").innerHTML = `<option value="">（暂不指定）</option>` + ownerOptions(blSel.value);
+      envSel.innerHTML = envsForBL(blSel.value).map((e) => `<option value="${e.value}">${esc(e.label)}</option>`).join("");
+    };
   }
 
   $("#m-submit").onclick = async () => {
@@ -651,6 +773,78 @@ function openAppModal(app) {
   };
 }
 
+/* ---------------- 应用交接（归属 + 权限，留痕） ---------------- */
+function openHandoverModal(app) {
+  const root = $("#modal-root");
+  // 候选新负责人：同业务线、启用中、非观察者、排除现任
+  const candidates = state.users.filter(
+    (u) => String(u.business_line_id) === String(app.business_line_id)
+      && u.active !== false && u.role !== "observer" && u.id !== app.owner_id);
+  root.innerHTML = `
+    <div class="modal-mask">
+      <div class="modal" style="width:600px">
+        <h3>应用交接 · ${esc(app.name)}</h3>
+        <p style="color:var(--ink-2);font-size:13px">
+          交接的是<b>应用归属与权限</b>：配置项随应用一并移交（配置档案/版本/留痕归属不变，无需搬运）；
+          新负责人会获得原负责人在该业务线各环境的权限，并可选择是否收回原负责人的权限。
+          交接前后谁负责、权限如何处置都会留痕。
+        </p>
+        <div class="form-grid" style="grid-template-columns:1fr">
+          <div>
+            <label>当前负责人</label>
+            <input value="${esc(app.owner_name || "（未设置）")}" disabled>
+          </div>
+          <div>
+            <label>移交给 *</label>
+            <select id="ho-to">
+              <option value="">请选择新负责人（须同业务线）</option>
+              ${candidates.map((u) => `<option value="${u.id}">${esc(u.name)}（${esc(u.role_label || u.role)}）</option>`).join("")}
+            </select>
+          </div>
+          <div>
+            <label class="check-line">
+              <input type="checkbox" id="ho-revoke" checked>
+              交接后收回原负责人在「${esc(app.business_line_name)}」的全部权限（离职/转岗场景勾选；并行协助可取消）
+            </label>
+          </div>
+          <div>
+            <label>交接原因 *（不少于 5 字）</label>
+            <textarea id="ho-reason" rows="3" placeholder="如：负责人离职转岗，应用移交新团队承接，工单号 HR-2026-091"></textarea>
+          </div>
+        </div>
+        <div class="form-error" id="ho-error"></div>
+        <div class="form-actions">
+          <button class="btn" id="ho-cancel">取消</button>
+          <button class="btn warn primary" id="ho-submit">确认交接并留痕</button>
+        </div>
+      </div>
+    </div>`;
+  const close = () => { root.innerHTML = ""; };
+  $("#ho-cancel").onclick = close;
+  $(".modal-mask", root).onclick = (e) => { if (e.target.classList.contains("modal-mask")) close(); };
+  $("#ho-submit").onclick = async () => {
+    const errBox = $("#ho-error");
+    errBox.classList.remove("show");
+    const toUserId = $("#ho-to").value;
+    const reason = $("#ho-reason").value.trim();
+    if (!toUserId) { errBox.textContent = "请选择新负责人"; errBox.classList.add("show"); return; }
+    if (reason.length < 5) { errBox.textContent = "交接原因不少于 5 个字"; errBox.classList.add("show"); return; }
+    if (!confirm("确认交接？应用归属与权限将立即转移并写入交接留痕。")) return;
+    try {
+      const res = await api(`/api/apps/${app.id}/handover`, {
+        method: "POST",
+        body: { to_user_id: +toUserId, reason, revoke_from: $("#ho-revoke").checked },
+      });
+      close();
+      toast("交接完成，权限处置与交接记录已留痕", "success");
+      renderAppDetail(app.id);
+    } catch (e) {
+      errBox.textContent = e.message;
+      errBox.classList.add("show");
+    }
+  };
+}
+
 /* ---------------- 配置档案 · 列表 ---------------- */
 function cfgTypeLabel(v) {
   const t = state.configMeta.types.find((x) => x.value === v);
@@ -668,22 +862,26 @@ function actionLabel(a) {
 async function renderConfigList() {
   const view = $("#view");
   const f = state.configFilters;
-  const isAdmin = state.user.role === "admin";
+  const admin = isAdmin();
+  const myEnvs = admin
+    ? state.meta.environments
+    : state.meta.environments.filter((e) =>
+        (state.myPerms.access || []).some((a) => a.environment === e.value));
   view.innerHTML = `
     <div class="page-head">
       <div>
         <h2>配置档案</h2>
-        <div class="sub">配置项按「应用 + 环境」管理：键、值、类型、生效范围、密文；密文默认脱敏</div>
+        <div class="sub">${admin ? "全部业务线 · 全部环境" : esc(state.myPerms.scope_text)} · 密文默认脱敏，查看明文与编辑权限分开授予</div>
       </div>
     </div>
     <div class="panel filter-bar">
-      <select id="cf-bl" ${isAdmin ? "" : "disabled"}>
+      <select id="cf-bl" ${admin ? "" : "disabled"}>
         <option value="">全部业务线</option>
         ${state.businessLines.map((b) => `<option value="${b.id}" ${String(b.id) === String(f.business_line_id) ? "selected" : ""}>${esc(b.name)}</option>`).join("")}
       </select>
       <select id="cf-env">
         <option value="">全部环境</option>
-        ${state.meta.environments.map((e) => `<option value="${e.value}" ${f.environment === e.value ? "selected" : ""}>${esc(e.label)}</option>`).join("")}
+        ${myEnvs.map((e) => `<option value="${e.value}" ${f.environment === e.value ? "selected" : ""}>${esc(e.label)}</option>`).join("")}
       </select>
       <button class="btn" id="cf-reset">重置</button>
     </div>
@@ -691,7 +889,7 @@ async function renderConfigList() {
 
   const load = async () => {
     const p = new URLSearchParams();
-    if (isAdmin && $("#cf-bl").value) p.set("business_line_id", $("#cf-bl").value);
+    if (admin && $("#cf-bl").value) p.set("business_line_id", $("#cf-bl").value);
     if ($("#cf-env").value) p.set("environment", $("#cf-env").value);
     try {
       const rows = await api(`/api/config/profiles?${p.toString()}`);
@@ -762,6 +960,10 @@ async function paintConfigProfile(appId, environment) {
     return;
   }
   const envTabs = state.meta.environments;
+  const perms = data.permissions || {};
+  const canEdit = !!perms.can_edit_config;
+  const canReveal = !!perms.can_view_secret;
+  const canManageApp = !!perms.can_manage_app;
   view.innerHTML = `
     <div class="page-head">
       <div>
@@ -773,9 +975,18 @@ async function paintConfigProfile(appId, environment) {
         <button class="btn" id="cp-app">查看应用</button>
       </div>
     </div>
+    ${!canEdit ? `<div class="panel perm-banner">
+      🔒 当前账号在该应用此环境没有<b>配置编辑权</b>，配置只读${canReveal ? "；你持有密文查看权，可申请查看明文" : "，也没有密文查看权"}。
+      能看明文 ≠ 能改，权限分开授予；如需编辑请联系平台管理员或业务线负责人。
+    </div>` : ""}
     <div class="env-tabs" id="cp-tabs">
-      ${envTabs.map((e) => `<a class="env-tab ${e.value === environment ? "active" : ""} ${e.value === "prod" ? "prod" : ""}"
-         href="#/config/${appId}/${e.value}">${esc(e.label)}</a>`).join("")}
+      ${envTabs.map((e) => {
+        const allowed = envVisible(data.business_line_id, e.value);
+        const cls = `env-tab ${e.value === environment ? "active" : ""} ${e.value === "prod" ? "prod" : ""} ${allowed ? "" : "locked"}`;
+        return allowed
+          ? `<a class="${cls}" href="#/config/${appId}/${e.value}">${esc(e.label)}</a>`
+          : `<span class="${cls}" title="该环境不在你的可见范围内">${esc(e.label)} 🔒</span>`;
+      }).join("")}
     </div>
     <div class="detail-grid cfg-grid">
       <div>
@@ -784,7 +995,9 @@ async function paintConfigProfile(appId, environment) {
             <h3 style="margin:0">配置项（${data.items.length}）</h3>
             <div style="display:flex;gap:8px">
               <button class="btn small" id="cp-diff-btn">环境对比</button>
-              ${data.read_only ? "" : '<button class="btn primary small" id="cp-edit-btn">编辑配置</button>'}
+              ${data.read_only ? "" : canEdit
+                ? '<button class="btn primary small" id="cp-edit-btn">编辑配置</button>'
+                : '<button class="btn small" disabled title="缺少配置编辑权：当前为只读">编辑配置（无权限）</button>'}
             </div>
           </div>
           ${data.read_only ? '<p style="color:var(--ink-3);font-size:13px;margin:8px 0 0">应用已下线（终态），配置档案只读。</p>' : ""}
@@ -801,23 +1014,34 @@ async function paintConfigProfile(appId, environment) {
   $("#cp-back").onclick = () => { location.hash = "#/config"; };
   $("#cp-app").onclick = () => { location.hash = `#/apps/${appId}`; };
   const diffBtn = $("#cp-diff-btn");
-  diffBtn.onclick = () => openEnvDiffModal(appId, environment);
+  const visibleEnvCount = isAdmin()
+    ? state.meta.environments.length
+    : state.meta.environments.filter((e) => envVisible(data.business_line_id, e.value)).length;
+  if (visibleEnvCount < 2) {
+    diffBtn.disabled = true;
+    diffBtn.textContent = "环境对比（仅可见 1 个环境）";
+    diffBtn.title = "你的可见范围内没有第二个环境，无法对比";
+  } else {
+    diffBtn.onclick = () => openEnvDiffModal(appId, environment, data.business_line_id);
+  }
   const editBtn = $("#cp-edit-btn");
   if (editBtn) editBtn.onclick = () => openConfigEditor(appId, environment, data);
 
-  paintConfigItems(data.items);
-  paintVersions(appId, environment, data.versions, data.read_only);
+  paintConfigItems(data.items, { canReveal });
+  paintVersions(appId, environment, data.versions, data.read_only || !canEdit);
 }
 
-function paintConfigItems(items) {
+function paintConfigItems(items, opts = {}) {
   const box = $("#cp-items");
+  const canReveal = opts.canReveal !== false;
   if (!items.length) {
-    box.innerHTML = `<div class="empty-tip">该环境暂无配置项，点「编辑配置」新增</div>`;
+    box.innerHTML = `<div class="empty-tip">该环境暂无配置项${canReveal ? "，点「编辑配置」新增" : ""}</div>`;
     return;
   }
+  const appId = appIdFromHash();
   box.innerHTML = `
     <table class="env-table cfg-table">
-      <thead><tr><th>键</th><th>值</th><th>类型</th><th>范围</th><th style="width:72px"></th></tr></thead>
+      <thead><tr><th>键</th><th>值</th><th>类型</th><th>范围</th><th style="width:96px"></th></tr></thead>
       <tbody>
         ${items.map((it) => `
           <tr>
@@ -827,12 +1051,15 @@ function paintConfigItems(items) {
               : esc(it.value)}</td>
             <td><span class="meta-tag">${esc(cfgTypeLabel(it.value_type))}</span></td>
             <td><span class="meta-tag">${esc(cfgScopeLabel(it.scope))}</span></td>
-            <td>${it.is_secret ? `<button class="btn small" data-reveal="${it.id}" data-key="${esc(it.key)}">看明文</button>` : ""}</td>
+            <td>${it.is_secret ? (canReveal
+                ? `<button class="btn small" data-reveal="${it.id}" data-key="${esc(it.key)}">看明文</button>`
+                : `<button class="btn small" disabled title="缺少密文查看权：能看到脱敏值不代表能看明文">看明文🔒</button>`)
+              : ""}</td>
           </tr>`).join("")}
       </tbody>
     </table>`;
   $$("[data-reveal]", box).forEach((btn) => {
-    btn.onclick = () => openRevealModal(appIdFromHash(), btn.dataset.reveal, btn.dataset.key);
+    btn.onclick = () => openRevealModal(appId, btn.dataset.reveal, btn.dataset.key);
   });
 }
 
@@ -1020,9 +1247,9 @@ function openConfigEditor(appId, environment, data) {
   }
   paint();
 
-  $("#ce-submit").onclick = async () => {
+  const submit = async (force) => {
     const errBox = $("#ce-error");
-    errBox.classList.remove("show");
+    if (errBox) errBox.classList.remove("show");
     const items = rows.filter((r) => r.key.trim()).map((r) => ({
       key: r.key.trim(),
       value: r.value,
@@ -1040,18 +1267,84 @@ function openConfigEditor(appId, environment, data) {
       errBox.classList.add("show");
       return;
     }
+    const submitBtn = $("#ce-submit");
+    if (submitBtn) submitBtn.disabled = true;
     try {
       const res = await api(`/api/apps/${appId}/config?environment=${encodeURIComponent(environment)}`, {
         method: "PUT",
-        body: { items, change_note: $("#ce-note").value.trim() },
+        body: {
+          items, change_note: $("#ce-note").value.trim(),
+          base_version: data.current_version || 0, force: !!force,
+        },
       });
       close();
-      toast(`已生成 v${res.version}，${res.changes} 个键发生变化`, "success");
+      toast(`已生成 v${res.version}，${res.changes} 个键发生变化${force ? "（冲突后显式覆盖，已留痕）" : ""}`, "success");
       paintConfigProfile(appId, environment);
     } catch (e) {
-      errBox.textContent = e.message;
-      errBox.classList.add("show");
+      if (submitBtn) submitBtn.disabled = false;
+      if (e.status === 409 && e.data && e.data.detail && e.data.detail.code === "config_version_conflict") {
+        // 不许静默盖掉：先展示对方改了什么，由人做取舍
+        openConflictModal(e.data.detail, () => submit(true));
+        return;
+      }
+      if (errBox) {
+        errBox.textContent = e.message;
+        errBox.classList.add("show");
+      } else {
+        toast(e.message, "error");
+      }
     }
+  };
+  $("#ce-submit").onclick = () => submit(false);
+}
+
+/* ---------------- 并发冲突取舍（两个浏览器同时改同一条配置） ---------------- */
+function openConflictModal(cf, onForce) {
+  const envLabel = (v) => state.meta.environments.find((e) => e.value === v)?.label || v;
+  const root = $("#modal-root");
+  root.innerHTML = `
+    <div class="modal-mask">
+      <div class="modal" style="width:860px">
+        <h3>⚠️ 配置已被他人更新（v${cf.base_version} → v${cf.current_version}）</h3>
+        <p style="color:var(--red);font-size:13px;margin:4px 0 10px">${esc(cf.message)}</p>
+        <div id="cf-versions" style="margin-bottom:10px">
+          ${(cf.intervening_versions || []).map((v) => `
+            <div class="cf-ver">
+              <b>v${v.version}</b> · ${esc(v.created_by_name)} · ${fmtAgo(v.created_at)}
+              ${v.change_note ? ` · ${esc(v.change_note)}` : ""}
+            </div>`).join("")}
+        </div>
+        <table class="env-table diff-table">
+          <thead><tr><th>键</th><th>你打开时 v${cf.base_version}</th><th></th><th>对方保存后 v${cf.current_version}</th></tr></thead>
+          <tbody>
+            ${(cf.entries || []).map((e) => `
+              <tr class="diff-${e.status}">
+                <td class="mono">${esc(e.key)}</td>
+                <td class="mono">${e.a ? sideValue(e.a) : '<span class="diff-gone">（无）</span>'}</td>
+                <td>${diffArrow(e.status)}</td>
+                <td class="mono">${e.b ? sideValue(e.b) : '<span class="diff-gone">（无）</span>'}</td>
+              </tr>`).join("")}
+          </tbody>
+        </table>
+        <p style="color:var(--ink-3);font-size:12px;margin:10px 0 0">
+          「刷新后重新编辑」会放弃你当前表单、按对方最新版本重做；「显式覆盖」会用你的内容生成新版本，
+          对方改动被覆盖一事将逐键写入留痕。
+        </p>
+        <div class="form-actions">
+          <button class="btn primary" id="cf-refresh">放弃我的改动，刷新后重新编辑</button>
+          <button class="btn danger" id="cf-force">我已确认，显式覆盖（留痕）</button>
+        </div>
+      </div>
+    </div>`;
+  $("#cf-refresh").onclick = () => {
+    root.innerHTML = "";
+    const parts = location.hash.split("/");
+    paintConfigProfile(parts[2], parts[3] || "");
+  };
+  $("#cf-force").onclick = () => {
+    root.innerHTML = "";
+    if (!confirm("确认用你的内容覆盖对方刚保存的版本？该取舍会写入配置留痕。")) return;
+    onForce();
   };
 }
 
@@ -1124,19 +1417,27 @@ async function openRollbackModal(appId, environment, targetVersion) {
   const close = () => { root.innerHTML = ""; };
   $("#rb-cancel").onclick = close;
   $(".modal-mask", root).onclick = (e) => { if (e.target.classList.contains("modal-mask")) close(); };
-  $("#rb-submit").onclick = async () => {
+  const submitRollback = async (force) => {
     try {
       const res = await api(`/api/apps/${appId}/config/rollback`, {
-        method: "POST", body: { environment, version: targetVersion },
+        method: "POST",
+        body: { environment, version: targetVersion,
+                base_version: preview.from_version, force: !!force },
       });
       close();
       toast(`已回滚：生成 v${res.version}，${res.changes} 个键变化；历史留痕已保留`, "success");
       paintConfigProfile(appId, environment);
     } catch (e) {
+      if (e.status === 409 && e.data && e.data.detail && e.data.detail.code === "config_version_conflict") {
+        openConflictModal(e.data.detail, () => submitRollback(true));
+        return;
+      }
       const box = $("#rb-error");
-      box.textContent = e.message; box.classList.add("show");
+      if (box) { box.textContent = e.message; box.classList.add("show"); }
+      else toast(e.message, "error");
     }
   };
+  $("#rb-submit").onclick = () => submitRollback(false);
 }
 
 function sideValue(side) {
@@ -1147,9 +1448,17 @@ function diffArrow(status) {
 }
 
 /* ---------------- 环境对比 ---------------- */
-function openEnvDiffModal(appId, curEnv) {
+function openEnvDiffModal(appId, curEnv, blId) {
   const root = $("#modal-root");
-  const otherEnvs = state.meta.environments.filter((e) => e.value !== curEnv);
+  // 环境可见集合按授权范围过滤（blId 显式传入，避免跨应用串味）
+  const visibleEnvs = isAdmin()
+    ? state.meta.environments
+    : state.meta.environments.filter((e) => envVisible(blId, e.value));
+  const otherEnvs = visibleEnvs.filter((e) => e.value !== curEnv);
+  if (otherEnvs.length === 0) {
+    toast("你的可见范围内没有第二个环境可对比", "error");
+    return;
+  }
   root.innerHTML = `
     <div class="modal-mask">
       <div class="modal" style="width:860px">
@@ -1216,24 +1525,28 @@ function paintDiffResult(d) {
 async function renderAudit() {
   const view = $("#view");
   const f = state.auditFilters;
-  const isAdmin = state.user.role === "admin";
+  const admin = isAdmin();
+  const myEnvs = admin
+    ? state.meta.environments
+    : state.meta.environments.filter((e) =>
+        (state.myPerms.access || []).some((a) => a.environment === e.value));
   view.innerHTML = `
     <div class="page-head">
       <div>
         <h2>变更留痕</h2>
-        <div class="sub">配置的每次改动：谁改的、改前改后是什么；密文值在留痕中同样脱敏</div>
+        <div class="sub">${admin ? "全部业务线 · 全部环境" : esc(state.myPerms.scope_text)} · 配置每次改动都有逐键流水，密文同样脱敏</div>
       </div>
       <button class="btn primary" id="au-export">导出差异清单 CSV</button>
     </div>
     <div class="panel filter-bar">
-      <select id="au-bl" ${isAdmin ? "" : "disabled"}>
+      <select id="au-bl" ${admin ? "" : "disabled"}>
         <option value="">全部业务线</option>
         ${state.businessLines.map((b) => `<option value="${b.id}" ${String(b.id) === String(f.business_line_id) ? "selected" : ""}>${esc(b.name)}</option>`).join("")}
       </select>
       <input id="au-app" placeholder="应用 ID（可留空）" value="${esc(f.app_id)}" style="width:130px">
       <select id="au-env">
         <option value="">全部环境</option>
-        ${state.meta.environments.map((e) => `<option value="${e.value}" ${f.environment === e.value ? "selected" : ""}>${esc(e.label)}</option>`).join("")}
+        ${myEnvs.map((e) => `<option value="${e.value}" ${f.environment === e.value ? "selected" : ""}>${esc(e.label)}</option>`).join("")}
       </select>
       <select id="au-action">
         <option value="">全部动作</option>
@@ -1249,7 +1562,7 @@ async function renderAudit() {
 
   const buildParams = () => {
     const p = new URLSearchParams();
-    if (isAdmin && $("#au-bl").value) p.set("business_line_id", $("#au-bl").value);
+    if (admin && $("#au-bl").value) p.set("business_line_id", $("#au-bl").value);
     if ($("#au-app").value.trim()) p.set("app_id", $("#au-app").value.trim());
     if ($("#au-env").value) p.set("environment", $("#au-env").value);
     if ($("#au-action").value) p.set("action", $("#au-action").value);
@@ -1327,6 +1640,230 @@ function paintAuditRows(rows) {
       </table>
     </div>
     <p style="color:var(--ink-3);font-size:12px;margin:8px 2px">最多返回最近 500 条；如需完整流水请用「导出差异清单 CSV」。</p>`;
+}
+
+/* ---------------- 权限与交接（平台管理员 / 业务线负责人） ---------------- */
+const PERM_META = [
+  { key: "can_view_secret", label: "密文查看" },
+  { key: "can_edit_config", label: "配置编辑" },
+  { key: "can_manage_app", label: "应用管理" },
+];
+
+function canManagePermissions() {
+  return isAdmin() || state.user.role === "bl_owner";
+}
+
+async function renderPermsPage() {
+  const view = $("#view");
+  if (!canManagePermissions()) {
+    view.innerHTML = errorStateHtml("403 无权访问", "仅平台管理员或业务线负责人可管理人员权限");
+    return;
+  }
+  view.innerHTML = `<div class="empty-tip">加载中…</div>`;
+  let users, logs;
+  try {
+    [users, logs] = await Promise.all([api("/api/users"), api("/api/permission-logs")]);
+  } catch (e) {
+    view.innerHTML = errorStateHtml("加载失败", e.message);
+    return;
+  }
+  view.innerHTML = `
+    <div class="page-head">
+      <div>
+        <h2>权限与交接</h2>
+        <div class="sub">角色四类；可见范围按 业务线 × 环境 收窄；密文查看 / 配置编辑 / 应用管理分开授予，变更全部留痕</div>
+      </div>
+    </div>
+    <div class="detail-grid">
+      <div class="panel panel-pad">
+        <h3>人员与授权（${users.length}）</h3>
+        <div class="perm-user-list">
+          ${users.map((u) => `
+            <div class="perm-user" data-uid="${u.id}">
+              <div class="pu-head">
+                <b>${esc(u.name)}</b>
+                <span class="u-role ${u.role === "admin" ? "admin" : ""}">${esc(u.role_label || u.role)}</span>
+                ${u.active === false ? '<span class="red-dot">已停用</span>' : ""}
+              </div>
+              <div class="pu-meta">${esc(u.username)} · ${esc(u.business_line_name || "平台")}</div>
+            </div>`).join("")}
+        </div>
+      </div>
+      <div class="panel panel-pad">
+        <h3>权限变更流水</h3>
+        <div id="perm-logs" class="log-list">
+          ${logs.length ? logs.map((l) => `
+            <div class="log-item">
+              <div><span class="action-tag">${esc(l.action_label)}</span>
+                <b>${esc(l.target_name)}</b>${l.business_line_name ? ` · ${esc(l.business_line_name)}${l.environment_label ? " · " + esc(l.environment_label) : ""}` : ""}</div>
+              <div class="log-detail">${esc(l.detail)}</div>
+              <div class="log-meta">${esc(l.actor_name)} · ${fmtTime(l.created_at)} · 理由：${esc(l.reason)}</div>
+            </div>`).join("") : '<div class="empty-tip">暂无权限变更记录</div>'}
+        </div>
+      </div>
+    </div>`;
+  $$("[data-uid]", view).forEach((el) => {
+    el.onclick = () => openPermEditor(+el.dataset.uid);
+  });
+}
+
+async function openPermEditor(userId) {
+  let p;
+  try {
+    p = await api(`/api/users/${userId}/permissions`);
+  } catch (e) { toast(e.message, "error"); return; }
+  const root = $("#modal-root");
+  const isMeAdmin = isAdmin();
+  const rows = p.access.map((a) => ({
+    business_line_id: a.business_line_id, environment: a.environment,
+    can_view_secret: a.can_view_secret, can_edit_config: a.can_edit_config,
+    can_manage_app: a.can_manage_app,
+  }));
+
+  const blChoices = () => isMeAdmin
+    ? state.businessLines
+    : state.businessLines.filter((b) =>
+        (state.myPerms.access || []).some((a) => a.business_line_id === b.id && a.can_manage_app));
+
+  root.innerHTML = `
+    <div class="modal-mask">
+      <div class="modal" style="width:860px">
+        <h3>权限设置 · ${esc(p.name)} <span class="u-role ${p.role === "admin" ? "admin" : ""}">${esc(p.role_label)}</span>
+          ${p.active ? "" : '<span class="red-dot">账号已停用</span>'}</h3>
+        <p style="color:var(--ink-3);font-size:12px;margin:2px 0 10px">${esc(p.username)} · ${esc(p.business_line_name || "平台")}</p>
+        <div class="form-grid" style="grid-template-columns:1fr">
+          <div>
+            <label>角色</label>
+            <select id="pe-role" ${isMeAdmin ? "" : "disabled"}>
+              ${(state.configMeta.roles || []).map((r) =>
+                `<option value="${r.value}" ${p.role === r.value ? "selected" : ""}>${esc(r.label)}</option>`).join("")}
+            </select>
+            ${isMeAdmin ? "" : '<p class="pe-note">业务线负责人只能调整本业务线内的环境授权，角色变更需平台管理员。</p>'}
+          </div>
+        </div>
+        <h4 style="margin:12px 0 6px">可见范围与授权（业务线 × 环境）</h4>
+        <table class="env-table perm-table" id="pe-table">
+          <thead><tr><th>业务线</th><th>环境</th><th>密文查看</th><th>配置编辑</th><th>应用管理</th><th style="width:48px"></th></tr></thead>
+          <tbody id="pe-tbody"></tbody>
+        </table>
+        <button class="btn small" id="pe-add" style="margin-top:8px">+ 添加一行授权</button>
+        <p class="pe-note" style="margin-top:8px">
+          没有任何授权行 = 完全不可见；只读观察者不允许勾选「配置编辑 / 应用管理」；密文查看与配置编辑互不包含。
+        </p>
+        <div class="form-grid" style="grid-template-columns:1fr;margin-top:6px">
+          <div>
+            <label>变更理由 *（不少于 5 字）</label>
+            <input id="pe-reason" maxlength="200" placeholder="如：最小权限整改，收回生产密文查看权，工单 SEC-2026-003">
+          </div>
+        </div>
+        <div class="form-error" id="pe-error"></div>
+        <div class="form-actions">
+          ${isMeAdmin && p.active && p.role !== "admin" ? '<button class="btn danger" id="pe-deactivate">停用账号（离职）</button>' : ""}
+          <span style="flex:1"></span>
+          <button class="btn" id="pe-cancel">取消</button>
+          <button class="btn primary" id="pe-submit">保存权限并留痕</button>
+        </div>
+      </div>
+    </div>`;
+  const close = () => { root.innerHTML = ""; };
+  $("#pe-cancel").onclick = close;
+  $(".modal-mask", root).onclick = (e) => { if (e.target.classList.contains("modal-mask")) close(); };
+
+  const tbody = $("#pe-tbody");
+  function paint() {
+    tbody.innerHTML = rows.map((r, i) => `
+      <tr>
+        <td>
+          <select data-i="${i}" data-f="business_line_id" ${isMeAdmin ? "" : "disabled"}>
+            ${blChoices().map((b) => `<option value="${b.id}" ${String(b.id) === String(r.business_line_id) ? "selected" : ""}>${esc(b.name)}</option>`).join("")}
+          </select>
+        </td>
+        <td>
+          <select data-i="${i}" data-f="environment">
+            ${state.meta.environments.map((e) => `<option value="${e.value}" ${r.environment === e.value ? "selected" : ""}>${esc(e.label)}</option>`).join("")}
+          </select>
+        </td>
+        ${PERM_META.map((m) => `
+          <td style="text-align:center">
+            <input type="checkbox" data-i="${i}" data-f="${m.key}" ${r[m.key] ? "checked" : ""}>
+          </td>`).join("")}
+        <td><button class="btn small danger" data-del="${i}">删</button></td>
+      </tr>`).join("");
+    $$("select,input", tbody).forEach((el) => {
+      el.onchange = () => {
+        const i = +el.dataset.i;
+        if (el.type === "checkbox") rows[i][el.dataset.f] = el.checked;
+        else rows[i][el.dataset.f] = isNaN(+el.value) ? el.value : +el.value;
+      };
+    });
+    $$("[data-del]", tbody).forEach((b) => {
+      b.onclick = () => { rows.splice(+b.dataset.del, 1); paint(); };
+    });
+  }
+  paint();
+  $("#pe-add").onclick = () => {
+    const bl0 = blChoices()[0];
+    rows.push({ business_line_id: bl0 ? bl0.id : null, environment: "prod",
+                can_view_secret: false, can_edit_config: false, can_manage_app: false });
+    paint();
+  };
+
+  $("#pe-submit").onclick = async () => {
+    const errBox = $("#pe-error");
+    errBox.classList.remove("show");
+    const reason = $("#pe-reason").value.trim();
+    if (reason.length < 5) { errBox.textContent = "变更理由不少于 5 个字，权限变更必须带理由留痕"; errBox.classList.add("show"); return; }
+    // 前端先按观察者约束拦一道（服务端也强制）
+    const role = $("#pe-role").value;
+    if (role === "observer" && rows.some((r) => r.can_edit_config || r.can_manage_app)) {
+      errBox.textContent = "只读观察者不能持有配置编辑/应用管理权（密文查看可单独授予）";
+      errBox.classList.add("show"); return;
+    }
+    const seen = new Set();
+    for (const r of rows) {
+      const k = `${r.business_line_id}@${r.environment}`;
+      if (seen.has(k)) { errBox.textContent = "授权行重复：同一业务线 × 环境只能有一行"; errBox.classList.add("show"); return; }
+      seen.add(k);
+    }
+    try {
+      await api(`/api/users/${userId}/permissions`, {
+        method: "PUT",
+        body: {
+          reason,
+          role: isMeAdmin ? role : null,
+          access: rows.map((r) => ({
+            business_line_id: r.business_line_id, environment: r.environment,
+            can_view_secret: !!r.can_view_secret, can_edit_config: !!r.can_edit_config,
+            can_manage_app: !!r.can_manage_app,
+          })),
+        },
+      });
+      close();
+      toast("权限已更新，变更内容写入权限流水", "success");
+      renderPermsPage();
+    } catch (e) {
+      errBox.textContent = e.message;
+      errBox.classList.add("show");
+    }
+  };
+
+  const deactBtn = $("#pe-deactivate");
+  if (deactBtn) {
+    deactBtn.onclick = async () => {
+      const reason = prompt("停用原因（不少于 5 字）。注意：名下仍有应用时必须先完成应用交接，否则会被拦下。");
+      if (reason === null) return;
+      if (reason.trim().length < 5) { toast("停用原因不少于 5 个字", "error"); return; }
+      try {
+        await api(`/api/users/${userId}/deactivate`, { method: "POST", body: { reason: reason.trim() } });
+        close();
+        toast("账号已停用，授权全部收回并留痕", "success");
+        renderPermsPage();
+      } catch (e) {
+        // 名下仍有应用时服务端 409 列出未交接清单：原样展示，不允许糊里糊涂停用
+        alert(e.message);
+      }
+    };
+  }
 }
 
 /* ---------------- 错误态 ---------------- */

@@ -24,6 +24,19 @@ KEY_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_.\-]{0,127}$")
 class NoChangeError(ValueError):
     """配置与当前值完全一致，不产生空版本。"""
 
+
+class ConflictError(Exception):
+    """乐观锁冲突：编辑基于的版本已不是最新版本（典型：两个浏览器同时改同一条配置）。
+
+    payload 携带 base→current 的逐键差异与对方操作信息，供前端给出"刷新合并 / 显式覆盖"取舍，
+    服务端绝不允许后来者静默盖掉前一个改动。
+    """
+
+    def __init__(self, payload: dict):
+        super().__init__(payload["message"])
+        self.payload = payload
+
+
 ACTION_LABELS = {
     "add": "新增",
     "update": "修改",
@@ -139,17 +152,70 @@ def write_app_change_log(conn, app_id: int, user_id: int, text: str) -> None:
 
 # ---------------------------------------------------------------- 保存（产生版本 + 留痕）
 
+def conflict_detail(conn, app_id: int, environment: str, base_version: int, latest: int) -> dict:
+    """组装乐观锁冲突详情：base→current 之间的版本与逐键差异（密文脱敏）。"""
+    ver_rows = conn.execute(
+        """SELECT v.version, v.change_note, v.created_at, u.name AS created_by_name
+           FROM config_versions v LEFT JOIN users u ON u.id = v.created_by
+           WHERE v.app_id = ? AND v.environment = ? AND v.version > ?
+           ORDER BY v.version""",
+        (app_id, environment, base_version),
+    ).fetchall()
+    base = conn.execute(
+        "SELECT snapshot FROM config_versions WHERE app_id = ? AND environment = ? AND version = ?",
+        (app_id, environment, base_version),
+    ).fetchone()
+    base_items = json.loads(base["snapshot"]) if base else []
+    now_rows = conn.execute(
+        "SELECT * FROM config_items WHERE app_id = ? AND environment = ?",
+        (app_id, environment),
+    ).fetchall()
+    entries = diff_item_lists([dict(r) for r in base_items], [dict(r) for r in now_rows])
+    changed = [e for e in entries if e["status"] != "same"]
+    versions = [{
+        "version": r["version"],
+        "change_note": r["change_note"],
+        "created_by_name": r["created_by_name"] or "系统",
+        "created_at": r["created_at"],
+    } for r in ver_rows]
+    others = "、".join(sorted({v["created_by_name"] for v in versions}))
+    return {
+        "code": "config_version_conflict",
+        "message": (
+            f"配置已被他人更新：你打开时基于 v{base_version}，当前已是 v{latest}"
+            + (f"（{others} 在你之后保存过）" if others else "")
+            + "。请刷新查看对方改动后再决定：合并后重新保存，或在确认风险后显式覆盖；"
+              "系统不会让后来者静默盖掉前一个改动。"
+        ),
+        "base_version": base_version,
+        "current_version": latest,
+        "intervening_versions": versions,
+        "entries": changed,
+        "summary": summarize_diff(entries),
+    }
+
+
 def save_profile(app_id: int, environment: str, items: list[dict], user: dict,
-                 change_note: str = "", rollback_from: int | None = None) -> dict:
+                 change_note: str = "", rollback_from: int | None = None,
+                 base_version: int | None = None, force: bool = False) -> dict:
     """整体保存某应用某环境的配置档案。
 
     与旧值逐键 diff 写留痕；无任何变化时拒绝产生空版本。
     rollback_from 不为 None 时，留痕动作记为 rollback，且这是一次"追加"而非覆盖。
+    base_version 为编辑所依据的版本号：与当前最新版本不一致时抛 ConflictError（409）；
+    force=True 表示用户已看过冲突、显式选择覆盖（留痕中注明）。
     """
     note = change_note.strip() if change_note else ""
     conn = get_conn()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        latest = latest_version_no(conn, app_id, environment)
+        if base_version is not None and base_version != latest:
+            if not force:
+                raise ConflictError(conflict_detail(conn, app_id, environment, base_version, latest))
+            # 显式覆盖：把取舍写进备注与逐条留痕，绝不允许"静默"盖掉
+            force_tag = f"冲突后显式覆盖（基于 v{base_version}，覆盖 v{latest} 的改动）"
+            note = f"{note}；{force_tag}" if note else force_tag
         old_rows = conn.execute(
             "SELECT * FROM config_items WHERE app_id = ? AND environment = ?",
             (app_id, environment),
@@ -202,6 +268,12 @@ def save_profile(app_id: int, environment: str, items: list[dict], user: dict,
         if not audit_rows:
             raise NoChangeError("配置内容没有任何变化，未生成新版本")
 
+        if base_version is not None and base_version != latest and force:
+            # 显式覆盖时逐键留痕也带上取舍说明
+            tag = f"冲突后显式覆盖 v{latest}（编辑基于 v{base_version}）"
+            audit_rows = [(a, k, o, n, s, (f"{r}；{tag}" if r else tag))
+                          for (a, k, o, n, s, r) in audit_rows]
+
         version_no = latest_version_no(conn, app_id, environment) + 1
         snapshot = json.dumps(items, ensure_ascii=False)
         cur = conn.execute(
@@ -242,7 +314,8 @@ def save_profile(app_id: int, environment: str, items: list[dict], user: dict,
         raise
 
 
-def rollback(app_id: int, environment: str, version_no: int, user: dict) -> dict:
+def rollback(app_id: int, environment: str, version_no: int, user: dict,
+             base_version: int | None = None, force: bool = False) -> dict:
     target = query_one(
         "SELECT * FROM config_versions WHERE app_id = ? AND environment = ? AND version = ?",
         (app_id, environment, version_no),
@@ -252,9 +325,13 @@ def rollback(app_id: int, environment: str, version_no: int, user: dict) -> dict
     current = latest_version_no(get_conn(), app_id, environment)
     if version_no == current:
         raise ValueError(f"v{version_no} 就是当前版本，无需回滚")
+    if base_version is not None and base_version != current and not force:
+        conn = get_conn()
+        raise ConflictError(conflict_detail(conn, app_id, environment, base_version, current))
     items = validate_items(json.loads(target["snapshot"]))
     return save_profile(app_id, environment, items, user,
-                        change_note=target["change_note"], rollback_from=version_no)
+                        change_note=target["change_note"], rollback_from=version_no,
+                        base_version=base_version, force=force)
 
 
 # ---------------------------------------------------------------- 环境对比
@@ -414,7 +491,7 @@ def _date_to_epoch(value: str | None, end: bool = False) -> int | None:
 def query_audit(user: dict, *, app_id: int | None = None, business_line_id: int | None = None,
                 environment: str | None = None, action: str | None = None,
                 start: str | None = None, end: str | None = None) -> tuple[str, list]:
-    """返回 (sql, params)，已强制业务线数据范围。"""
+    """返回 (sql, params)，已强制 业务线×环境 可见范围（无授权记录的组合查不到流水）。"""
     sql = """SELECT l.id, l.app_id, l.environment, l.version_id, l.action, l.config_key,
                     l.old_value, l.new_value, l.is_secret, l.reason, l.created_at,
                     a.name AS app_name, b.id AS business_line_id, b.name AS business_line_name,
@@ -426,8 +503,14 @@ def query_audit(user: dict, *, app_id: int | None = None, business_line_id: int 
              WHERE 1=1"""
     params: list = []
     if user["role"] != "admin":
-        sql += " AND a.business_line_id = ?"
-        params.append(user["business_line_id"])
+        # 业务线×环境 两级收窄：只返回 user_access 明确覆盖的组合
+        sql += (" AND EXISTS (SELECT 1 FROM user_access ua"
+                " WHERE ua.user_id = ? AND ua.business_line_id = a.business_line_id"
+                " AND ua.environment = l.environment)")
+        params.append(user["id"])
+        if business_line_id:
+            sql += " AND a.business_line_id = ?"
+            params.append(business_line_id)
     elif business_line_id:
         sql += " AND a.business_line_id = ?"
         params.append(business_line_id)

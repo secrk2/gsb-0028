@@ -1,20 +1,24 @@
 """织云系统 - 配置档案 & 变更留痕 API。
 
-所有接口都走 current_user 鉴权与业务线数据范围校验；
-密文相关规则在服务端强制执行（仅前端拦截不算数）。
+所有接口都走 current_user 鉴权；可见范围按 业务线×环境 两级收窄；
+密文查看权（can_view_secret）与配置编辑权（can_edit_config）分开校验；
+保存/回滚带乐观锁 base_version，并发改动返回 409 冲突详情而非静默覆盖。
 """
 import time
 from urllib.parse import quote
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from .. import config_service as svc
-from ..auth import User, check_bl_scope, err, get_app_checked
+from ..auth import (
+    User, can, err, get_app_checked, get_app_or_404, require_perm, require_visibility,
+    visibility_sql,
+)
 from ..db import (
     CONFIG_SCOPE_LABELS, CONFIG_SCOPES, CONFIG_TYPE_LABELS, CONFIG_TYPES,
-    ENVIRONMENTS, TERMINAL_STATUS, query, query_one,
+    ENVIRONMENTS, ROLE_LABELS, TERMINAL_STATUS, query, query_one,
 )
 
 router = APIRouter()
@@ -36,6 +40,8 @@ class ConfigItemIn(BaseModel):
 class SaveConfigIn(BaseModel):
     items: list[ConfigItemIn]
     change_note: str = Field(default="", max_length=200)
+    base_version: int | None = None  # 编辑所基于的版本；与当前不一致 → 409 冲突
+    force: bool = False              # 看过冲突后显式覆盖（留痕注明）
 
 
 class RevealIn(BaseModel):
@@ -46,6 +52,8 @@ class RevealIn(BaseModel):
 class RollbackIn(BaseModel):
     environment: str
     version: int
+    base_version: int | None = None
+    force: bool = False
 
 
 # ---------------------------------------------------------------- 辅助
@@ -54,6 +62,15 @@ def env_checked(environment: str) -> str:
     if environment not in ENVIRONMENTS:
         raise err(400, f"非法环境：{environment}，可选：{'/'.join(ENVIRONMENTS)}")
     return environment
+
+
+def conflict_response(exc: svc.ConflictError) -> HTTPException:
+    # detail 为结构化对象，前端可直接渲染对方改了哪些键
+    return HTTPException(status_code=409, detail=exc.payload)
+
+
+def has_env_anywhere(user: dict, environment: str) -> bool:
+    return user["role"] == "admin" or any(a["environment"] == environment for a in user.get("access", []))
 
 
 def updater_names(item_rows: list[dict]) -> dict[int, str]:
@@ -73,6 +90,7 @@ def config_meta(user: dict = User):
         "types": [{"value": t, "label": CONFIG_TYPE_LABELS[t]} for t in CONFIG_TYPES],
         "scopes": [{"value": s, "label": CONFIG_SCOPE_LABELS[s]} for s in CONFIG_SCOPES],
         "actions": [{"value": k, "label": v} for k, v in svc.ACTION_LABELS.items()],
+        "roles": [{"value": k, "label": v} for k, v in ROLE_LABELS.items()],
     }
 
 
@@ -82,7 +100,7 @@ def config_meta(user: dict = User):
 def list_profiles(user: dict = User,
                   business_line_id: int | None = None,
                   environment: str | None = None):
-    """有配置档案（至少一个版本）的 应用×环境 列表。"""
+    """有配置档案（至少一个版本）的 应用×环境 列表，按 业务线×环境 可见范围收窄。"""
     sql = """SELECT a.id AS app_id, a.name AS app_name, a.status AS app_status,
                     b.id AS business_line_id, b.name AS business_line_name,
                     x.environment, x.version AS latest_version,
@@ -101,26 +119,35 @@ def list_profiles(user: dict = User,
                  WHERE y.app_id = x.app_id AND y.environment = x.environment)"""
     params: list = []
     if user["role"] != "admin":
-        # 成员显式按其他业务线筛选属于越权，返回 403 而非静默收窄
-        if business_line_id and business_line_id != user["business_line_id"]:
-            check_bl_scope(user, business_line_id)
-        sql += " AND a.business_line_id = ?"
-        params.append(user["business_line_id"])
-    elif business_line_id:
-        sql += " AND a.business_line_id = ?"
-        params.append(business_line_id)
-    if environment:
-        env_checked(environment)
-        sql += " AND x.environment = ?"
-        params.append(environment)
+        # 显式按未授权的业务线/环境筛选属于越权：403 并说明原因，而非静默给空
+        if business_line_id:
+            require_visibility(user, business_line_id, environment)
+        if environment:
+            env_checked(environment)
+            if not has_env_anywhere(user, environment):
+                raise err(403,
+                          f"无权查看任何业务线的「{environment}」环境：账号 {user['name']}"
+                          "的授权范围不包含该环境")
+        frag, fparams = visibility_sql(user, "a.business_line_id", "x.environment")
+        sql += frag
+        params.extend(fparams)
+    else:
+        if business_line_id:
+            sql += " AND a.business_line_id = ?"
+            params.append(business_line_id)
+        if environment:
+            env_checked(environment)
+            sql += " AND x.environment = ?"
+            params.append(environment)
     sql += " ORDER BY x.created_at DESC, a.id"
     return [dict(r) for r in query(sql, tuple(params))]
 
 
 @router.get("/api/apps/{app_id}/config")
 def get_config(app_id: int, environment: str, user: dict = User):
-    app_row = get_app_checked(user, app_id)
     env_checked(environment)
+    # 配置档案按"请求的环境"收窄，而不是应用台账上登记的那个环境
+    app_row = get_app_checked(user, app_id, environment=environment)
     rows = svc.current_items(app_id, environment)
     names = updater_names(rows)
     items = []
@@ -128,25 +155,45 @@ def get_config(app_id: int, environment: str, user: dict = User):
         d = svc.item_to_dict(r)
         d["updated_by_name"] = names.get(r["updated_by"])
         items.append(d)
+    latest = query_one(
+        "SELECT MAX(version) AS v FROM config_versions WHERE app_id = ? AND environment = ?",
+        (app_id, environment),
+    )
+    current_version = latest["v"] or 0
     return {
         "app_id": app_id,
         "app_name": app_row["name"],
+        "business_line_id": app_row["business_line_id"],
         "environment": environment,
         "read_only": app_row["status"] == TERMINAL_STATUS,
         "items": items,
         "versions": svc.list_versions(app_id, environment),
+        "current_version": current_version,
+        # 三个权限位分开下发，前端据此灰化按钮并给出原因，而不是藏起来留空白
+        "permissions": {
+            "can_view_secret": can(user, "can_view_secret", app_row["business_line_id"], environment),
+            "can_edit_config": can(user, "can_edit_config", app_row["business_line_id"], environment),
+            "can_manage_app": can(user, "can_manage_app", app_row["business_line_id"], environment),
+        },
     }
 
 
 @router.put("/api/apps/{app_id}/config")
 def save_config(app_id: int, environment: str, body: SaveConfigIn, user: dict = User):
-    app_row = get_app_checked(user, app_id)
     env_checked(environment)
+    app_row = get_app_checked(user, app_id, environment=environment)
+    # 能看明文 ≠ 能改：编辑权单独校验，拒绝信息说明缺什么
+    require_perm(user, "can_edit_config", app_row["business_line_id"], environment)
     if app_row["status"] == TERMINAL_STATUS:
         raise err(400, "应用已下线（终态），配置档案只读，禁止修改")
     try:
         items = svc.validate_items([it.model_dump() for it in body.items])
-        result = svc.save_profile(app_id, environment, items, user, change_note=body.change_note)
+        result = svc.save_profile(
+            app_id, environment, items, user, change_note=body.change_note,
+            base_version=body.base_version, force=body.force,
+        )
+    except svc.ConflictError as e:
+        raise conflict_response(e)
     except ValueError as e:
         raise err(400, str(e))
     return {"ok": True, **result}
@@ -154,12 +201,18 @@ def save_config(app_id: int, environment: str, body: SaveConfigIn, user: dict = 
 
 @router.post("/api/apps/{app_id}/config/rollback", status_code=201)
 def rollback_config(app_id: int, body: RollbackIn, user: dict = User):
-    app_row = get_app_checked(user, app_id)
     env_checked(body.environment)
+    app_row = get_app_checked(user, app_id, environment=body.environment)
+    require_perm(user, "can_edit_config", app_row["business_line_id"], body.environment)
     if app_row["status"] == TERMINAL_STATUS:
         raise err(400, "应用已下线（终态），配置档案只读，禁止回滚")
     try:
-        result = svc.rollback(app_id, body.environment, body.version, user)
+        result = svc.rollback(
+            app_id, body.environment, body.version, user,
+            base_version=body.base_version, force=body.force,
+        )
+    except svc.ConflictError as e:
+        raise conflict_response(e)
     except LookupError as e:
         raise err(404, str(e))
     except ValueError as e:
@@ -172,7 +225,6 @@ def rollback_config(app_id: int, body: RollbackIn, user: dict = User):
 
 @router.post("/api/apps/{app_id}/config/reveal")
 def reveal_secret(app_id: int, body: RevealIn, user: dict = User):
-    get_app_checked(user, app_id)
     reason = body.reason.strip()
     # 服务端强制：理由为空或过短直接拒绝，前端有没有拦都一样
     if len(reason) < REVEAL_REASON_MIN:
@@ -183,6 +235,9 @@ def reveal_secret(app_id: int, body: RevealIn, user: dict = User):
     )
     if not item:
         raise err(404, f"配置项 #{body.item_id} 不存在")
+    # 密文查看权按"该密文所在环境"单独校验：能改配置不代表能看明文
+    app_row = get_app_checked(user, app_id, environment=item["environment"])
+    require_perm(user, "can_view_secret", app_row["business_line_id"], item["environment"])
     if not item["is_secret"]:
         raise err(400, "该配置项不是密文，无需查看明文")
     svc.log_reveal(app_id, item["environment"], body.item_id, item["key"], user, reason)
@@ -198,11 +253,14 @@ def reveal_secret(app_id: int, body: RevealIn, user: dict = User):
 
 @router.get("/api/apps/{app_id}/config/diff")
 def diff_config(app_id: int, env_a: str, env_b: str, user: dict = User):
-    get_app_checked(user, app_id)
     env_checked(env_a)
     env_checked(env_b)
     if env_a == env_b:
         raise err(400, "环境对比必须选择两个不同的环境")
+    app_row = get_app_or_404(app_id)
+    # 对比的两个环境都必须在可见范围内
+    require_visibility(user, app_row["business_line_id"], env_a)
+    require_visibility(user, app_row["business_line_id"], env_b)
     return svc.diff_environments(app_id, env_a, env_b)
 
 
@@ -210,15 +268,15 @@ def diff_config(app_id: int, env_a: str, env_b: str, user: dict = User):
 
 @router.get("/api/apps/{app_id}/config/versions")
 def get_versions(app_id: int, environment: str, user: dict = User):
-    get_app_checked(user, app_id)
     env_checked(environment)
+    get_app_checked(user, app_id, environment=environment)
     return svc.list_versions(app_id, environment)
 
 
 @router.get("/api/apps/{app_id}/config/versions/{version_no}")
 def get_version(app_id: int, version_no: int, environment: str, user: dict = User):
-    get_app_checked(user, app_id)
     env_checked(environment)
+    get_app_checked(user, app_id, environment=environment)
     try:
         return svc.version_detail(app_id, environment, version_no)
     except LookupError as e:
@@ -227,8 +285,8 @@ def get_version(app_id: int, version_no: int, environment: str, user: dict = Use
 
 @router.get("/api/apps/{app_id}/config/rollback-preview")
 def rollback_preview(app_id: int, environment: str, version: int, user: dict = User):
-    get_app_checked(user, app_id)
     env_checked(environment)
+    get_app_checked(user, app_id, environment=environment)
     try:
         return svc.rollback_preview(app_id, environment, version)
     except LookupError as e:
@@ -243,14 +301,16 @@ def _audit_rows(user: dict, app_id, business_line_id, environment, action, start
     if environment:
         env_checked(environment)
     if app_id:
-        # 按应用查询同样要过业务线范围校验，越权返回 403 而非空列表
+        # 按应用查询同样要过范围校验（应用 BL + 指定环境），越权返回 403 而非空列表
         app_row = query_one("SELECT id, business_line_id FROM applications WHERE id = ?", (app_id,))
         if not app_row:
             raise err(404, f"应用 #{app_id} 不存在")
-        check_bl_scope(user, app_row["business_line_id"])
+        require_visibility(user, app_row["business_line_id"], environment)
     elif business_line_id:
-        # 成员显式按其他业务线筛选属于越权
-        check_bl_scope(user, business_line_id)
+        # 显式按未授权业务线筛选属于越权
+        require_visibility(user, business_line_id, environment)
+    elif environment and not has_env_anywhere(user, environment):
+        raise err(403, f"无权查看任何业务线的「{environment}」环境留痕")
     try:
         sql, params = svc.query_audit(
             user, app_id=app_id, business_line_id=business_line_id,
